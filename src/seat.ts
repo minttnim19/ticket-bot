@@ -14,6 +14,7 @@ export type SeatRetryOptions = {
   maxRetries: number;
   adjacentRetryRounds?: number;
   retryIntervalMs: number;
+  onZoneOrder?: (strategy: SeatSelectionStrategy, zoneNames: string[]) => void;
 };
 
 export type SeatSelectionStrategy =
@@ -35,6 +36,19 @@ type SeatCandidate = {
   label: string;
 };
 
+type ZoneCandidateMeta = {
+  locator: Locator;
+  zoneName: string;
+  tagName: string;
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  centerX: number;
+  centerY: number;
+  domIndex: number;
+};
+
 const unavailablePatterns = [
   { label: "coming soon", pattern: /coming\s*soon/i },
   { label: "temporarily unavailable", pattern: /temporarily\s*unavailable/i },
@@ -42,6 +56,8 @@ const unavailablePatterns = [
   { label: "หมด", pattern: /หมด/i },
   { label: "ยังไม่เปิด", pattern: /ยังไม่เปิด/i },
 ] as const;
+const zoneSuffixPattern = /#([A-Z0-9]+)$/i;
+const seatTitlePattern = /^([A-Z]+)-(\d+)$/i;
 
 async function firstVisibleLocator(
   candidates: Locator[],
@@ -59,7 +75,7 @@ async function firstVisibleLocator(
 
 export async function readPageText(page: Page): Promise<string> {
   const text = await page.locator("body").innerText().catch(() => "");
-  return text.replace(/\s+/g, " ").trim();
+  return text.replaceAll(/\s+/g, " ").trim();
 }
 
 export async function pageLooksUnavailable(page: Page): Promise<boolean> {
@@ -166,19 +182,211 @@ async function matchesZoneTypePreference(
 async function inferZoneName(zoneOption: Locator): Promise<string | null> {
   const href = await zoneOption.getAttribute("href").catch(() => null);
   if (href) {
-    const match = href.match(/#([A-Z0-9]+)$/i);
+    const match = zoneSuffixPattern.exec(href);
     if (match) {
       return match[1].toUpperCase();
     }
   }
 
-  const dataZone = await zoneOption.getAttribute("data-zone").catch(() => null);
+  const dataZone = await zoneOption
+    .evaluate((node) => {
+      const element = node as { dataset?: { zone?: string } };
+      return element.dataset?.zone ?? null;
+    })
+    .catch(() => null);
   if (dataZone) {
     return dataZone.trim().toUpperCase();
   }
 
   const text = (await zoneOption.textContent().catch(() => ""))?.trim();
   return text ? text.toUpperCase() : null;
+}
+
+async function readZoneGeometry(zoneOption: Locator): Promise<{
+  tagName: string;
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  centerX: number;
+  centerY: number;
+}> {
+  return zoneOption
+    .evaluate((node) => {
+      const element = node as {
+        tagName: string;
+        getAttribute: (name: string) => string | null;
+        getBoundingClientRect?: () => {
+          left: number;
+          right: number;
+          top: number;
+          bottom: number;
+          width: number;
+          height: number;
+        };
+      };
+      const tagName = element.tagName.toLowerCase();
+
+      if (tagName === "area") {
+        const coordsText = element.getAttribute("coords") ?? "";
+        const values = coordsText
+          .split(",")
+          .map((value) => Number.parseFloat(value.trim()))
+          .filter((value) => Number.isFinite(value));
+        const xs = values.filter((_, index) => index % 2 === 0);
+        const ys = values.filter((_, index) => index % 2 === 1);
+        const minX = xs.length ? Math.min(...xs) : 0;
+        const maxX = xs.length ? Math.max(...xs) : 0;
+        const minY = ys.length ? Math.min(...ys) : 0;
+        const maxY = ys.length ? Math.max(...ys) : 0;
+        return {
+          tagName,
+          minX,
+          maxX,
+          minY,
+          maxY,
+          centerX: (minX + maxX) / 2,
+          centerY: (minY + maxY) / 2,
+        };
+      }
+
+      const rect = element.getBoundingClientRect?.();
+      const minX = rect?.left ?? 0;
+      const maxX = rect?.right ?? 0;
+      const minY = rect?.top ?? 0;
+      const maxY = rect?.bottom ?? 0;
+      return {
+        tagName,
+        minX,
+        maxX,
+        minY,
+        maxY,
+        centerX: rect ? minX + rect.width / 2 : 0,
+        centerY: rect ? minY + rect.height / 2 : 0,
+      };
+    })
+    .catch(() => ({
+      tagName: "",
+      minX: 0,
+      maxX: 0,
+      minY: 0,
+      maxY: 0,
+      centerX: 0,
+      centerY: 0,
+    }));
+}
+
+function compareZoneCandidates(
+  left: ZoneCandidateMeta,
+  right: ZoneCandidateMeta,
+  strategy: SeatSelectionStrategy,
+  mapCenterX: number,
+): number {
+  const leftCenterDistance = Math.abs(left.centerX - mapCenterX);
+  const rightCenterDistance = Math.abs(right.centerX - mapCenterX);
+
+  if (strategy === "closest-stage") {
+    if (left.minY !== right.minY) {
+      return left.minY - right.minY;
+    }
+    if (leftCenterDistance !== rightCenterDistance) {
+      return leftCenterDistance - rightCenterDistance;
+    }
+    return left.domIndex - right.domIndex;
+  }
+
+  if (strategy === "center-most") {
+    if (leftCenterDistance !== rightCenterDistance) {
+      return leftCenterDistance - rightCenterDistance;
+    }
+    if (left.minY !== right.minY) {
+      return left.minY - right.minY;
+    }
+    return left.domIndex - right.domIndex;
+  }
+
+  if (strategy === "front-left") {
+    if (left.minY !== right.minY) {
+      return left.minY - right.minY;
+    }
+    if (left.centerX !== right.centerX) {
+      return left.centerX - right.centerX;
+    }
+    return left.domIndex - right.domIndex;
+  }
+
+  if (strategy === "front-right") {
+    if (left.minY !== right.minY) {
+      return left.minY - right.minY;
+    }
+    if (left.centerX !== right.centerX) {
+      return right.centerX - left.centerX;
+    }
+    return left.domIndex - right.domIndex;
+  }
+
+  if (strategy === "back-left") {
+    if (left.maxY !== right.maxY) {
+      return right.maxY - left.maxY;
+    }
+    if (left.centerX !== right.centerX) {
+      return left.centerX - right.centerX;
+    }
+    return left.domIndex - right.domIndex;
+  }
+
+  if (strategy === "back-right") {
+    if (left.maxY !== right.maxY) {
+      return right.maxY - left.maxY;
+    }
+    if (left.centerX !== right.centerX) {
+      return right.centerX - left.centerX;
+    }
+    return left.domIndex - right.domIndex;
+  }
+
+  return left.domIndex - right.domIndex;
+}
+
+async function collectZoneCandidates(
+  page: Page,
+  zoneTypePreference: ZoneTypePreference,
+  excludedZones: string[],
+): Promise<ZoneCandidateMeta[]> {
+  const candidateGroups = [
+    page.locator('map area[href*="#fixed.php#"], map area[href*="#festival.php#"]'),
+    page.locator("[data-zone]"),
+    page.locator("button[data-zone]"),
+    page.locator("a[data-zone]"),
+  ];
+  const candidates: ZoneCandidateMeta[] = [];
+  let domIndex = 0;
+
+  for (const candidateGroup of candidateGroups) {
+    const count = await candidateGroup.count();
+    for (let index = 0; index < count; index += 1) {
+      const locator = candidateGroup.nth(index);
+      const zoneName = await inferZoneName(locator);
+      if (!zoneName || excludedZones.includes(zoneName)) {
+        continue;
+      }
+
+      if (!(await matchesZoneTypePreference(locator, zoneTypePreference))) {
+        continue;
+      }
+
+      const geometry = await readZoneGeometry(locator);
+      candidates.push({
+        locator,
+        zoneName,
+        domIndex,
+        ...geometry,
+      });
+      domIndex += 1;
+    }
+  }
+
+  return candidates;
 }
 
 export async function choosePreferredZone(
@@ -237,48 +445,30 @@ export async function chooseAnyZone(
   page: Page,
   zoneTypePreference: ZoneTypePreference = "both",
   excludedZones: string[] = [],
+  seatSelectionStrategy: SeatSelectionStrategy = "default",
+  onZoneOrder?: (strategy: SeatSelectionStrategy, zoneNames: string[]) => void,
 ): Promise<string | null> {
-  const candidates = [
-    page.locator('map area[href*="#fixed.php#"], map area[href*="#festival.php#"]'),
-    page.locator("[data-zone]"),
-    page.locator("button[data-zone]"),
-    page.locator("a[data-zone]"),
-  ];
+  const candidates = await collectZoneCandidates(page, zoneTypePreference, excludedZones);
+  const xs = candidates.flatMap((candidate) => [candidate.minX, candidate.maxX]);
+  const mapCenterX = xs.length
+    ? (Math.min(...xs) + Math.max(...xs)) / 2
+    : Number.POSITIVE_INFINITY;
+  const sortedCandidates =
+    seatSelectionStrategy === "default"
+      ? candidates
+      : [...candidates].sort((left, right) =>
+          compareZoneCandidates(left, right, seatSelectionStrategy, mapCenterX),
+        );
+  onZoneOrder?.(
+    seatSelectionStrategy,
+    sortedCandidates.map((candidate) => candidate.zoneName),
+  );
 
-  for (const candidateGroup of candidates) {
-    const count = await candidateGroup.count();
-    for (let index = 0; index < count; index += 1) {
-      const zoneOption = candidateGroup.nth(index);
-      const zoneName = await inferZoneName(zoneOption);
-      if (!zoneName) {
-        continue;
-      }
-      if (zoneName && excludedZones.includes(zoneName)) {
-        continue;
-      }
-
-      if (!(await matchesZoneTypePreference(zoneOption, zoneTypePreference))) {
-        continue;
-      }
-
-      const tagName = await zoneOption
-        .evaluate((node) => node.tagName.toLowerCase())
-        .catch(() => "");
-
-      if (tagName === "area") {
-        const clicked = await clickZoneLocator(zoneOption);
-        if (clicked) {
-          await waitForZoneTransition(page);
-          return zoneName;
-        }
-        continue;
-      }
-
-      const clicked = await clickZoneLocator(zoneOption);
-      if (clicked) {
-        await waitForZoneTransition(page);
-        return zoneName;
-      }
+  for (const candidate of sortedCandidates) {
+    const clicked = await clickZoneLocator(candidate.locator);
+    if (clicked) {
+      await waitForZoneTransition(page);
+      return candidate.zoneName;
     }
   }
 
@@ -324,7 +514,7 @@ export async function countSelectableZones(
 }
 
 function parseSeatTitle(title: string): { row: string; number: number } | null {
-  const match = title.match(/^([A-Z]+)-(\d+)$/i);
+  const match = seatTitlePattern.exec(title);
   if (!match) {
     return null;
   }
@@ -536,7 +726,11 @@ function pickClosestStageAdjacentSeats(
         continue;
       }
 
-      const blockCenter = (slice[0].number + slice[slice.length - 1].number) / 2;
+      const lastSeat = slice.at(-1);
+      if (!lastSeat) {
+        continue;
+      }
+      const blockCenter = (slice[0].number + lastSeat.number) / 2;
       const score = {
         rowOrder: slice[0].rowOrder,
         centerDistance: Math.abs(blockCenter - getRowCenter(rowCenters, row)),
@@ -592,7 +786,11 @@ function pickCenterMostAdjacentSeats(
         continue;
       }
 
-      const blockCenter = (slice[0].number + slice[slice.length - 1].number) / 2;
+      const lastSeat = slice.at(-1);
+      if (!lastSeat) {
+        continue;
+      }
+      const blockCenter = (slice[0].number + lastSeat.number) / 2;
       const score = {
         centerDistance: Math.abs(blockCenter - getRowCenter(rowCenters, row)),
         rowOrder: slice[0].rowOrder,
@@ -746,7 +944,7 @@ export async function selectSeatSet(
     preferredRows,
     selectionStrategy,
   );
-  if (preferredSet && preferredSet.length === desiredCount) {
+  if (preferredSet?.length === desiredCount) {
     return clickSeatSet(page, preferredSet);
   }
 
@@ -782,7 +980,13 @@ export async function retrySeatSelection(
     }
 
     if (!pickedZoneName && options.allowFallbackAnyZone) {
-      pickedZoneName = await chooseAnyZone(page, options.zoneTypePreference, [...exhaustedZones]);
+      pickedZoneName = await chooseAnyZone(
+        page,
+        options.zoneTypePreference,
+        [...exhaustedZones],
+        options.seatSelectionStrategy ?? "default",
+        options.onZoneOrder,
+      );
     }
 
     if (pickedZoneName) {

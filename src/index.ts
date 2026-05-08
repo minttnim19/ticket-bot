@@ -1,5 +1,5 @@
-import { existsSync } from "fs";
-import { createServer, IncomingMessage, ServerResponse, Server } from "http";
+import { existsSync } from "node:fs";
+import { createServer, IncomingMessage, ServerResponse, Server } from "node:http";
 import { Browser, BrowserContext, chromium, Page } from "playwright";
 import { concertConfig } from "./config";
 import { loadEnvFile } from "./env";
@@ -8,7 +8,6 @@ import {
   chooseAnyZone,
   choosePreferredZone,
   findUnavailableReason,
-  pageLooksUnavailable,
   readPageText,
   retrySeatSelection,
   type SeatSelectionStrategy,
@@ -62,6 +61,172 @@ type RoundHintsResponse = {
   saleOpen: boolean;
   notice?: string;
 };
+
+const trailingSlashPattern = /\/+$/;
+const saleDateTimePattern =
+  /วันเปิดจำหน่าย(?:บัตร)?\s*:?\s*วัน[^\d]*?(\d{1,2})\s+([ก-๙]+)\s+(\d{4}).{0,40}?(\d{1,2}):(\d{2})/i;
+const dataButtonPattern = /data-button["'=:\s]*([a-z0-9_-]+)/i;
+const bookingUrlPattern = /https?:\/\/[^\s"'<>]+|\/booking\/[^\s"'<>]+/i;
+const timePattern = /\b(?:[01]?\d|2[0-3]):[0-5]\d\b/;
+const colLabelPattern =
+  /<div[^>]*class="[^"]*col-label[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<div[^>]*class="[^"]*col-btn[^"]*"/i;
+const venueTextPattern = /<a[^>]*class="[^"]*venue[^"]*"[^>]*>([\s\S]*?)<\/a>/i;
+const priceTextPattern = /ราคาบัตร<\/small><br[^>]*>([\s\S]*?)<\/p>/i;
+const popupSigninBookingPattern = /popup\.signin\('([^']+booking[^']+)'\)/i;
+const onclickBookingPattern = /onclick="[^"]*(https?:\/\/[^"]+booking[^"]+)"/i;
+const hrefBookingPattern = /href="([^"]*(?:zones|queue|booking)\.php[^"]*)"/i;
+const dataButtonHtmlPattern = /data-button="([^"]+)"/i;
+const thaiMonthIndex: Record<string, number> = {
+  มกราคม: 0,
+  กุมภาพันธ์: 1,
+  มีนาคม: 2,
+  เมษายน: 3,
+  พฤษภาคม: 4,
+  มิถุนายน: 5,
+  กรกฎาคม: 6,
+  สิงหาคม: 7,
+  กันยายน: 8,
+  ตุลาคม: 9,
+  พฤศจิกายน: 10,
+  ธันวาคม: 11,
+};
+
+function execPattern(pattern: RegExp, text: string): RegExpExecArray | null {
+  pattern.lastIndex = 0;
+  return pattern.exec(text);
+}
+
+function extractTimeText(text: string): string | undefined {
+  return execPattern(timePattern, text)?.[0];
+}
+
+function formatRoundSelectionLabel(venueText: string, label: string): string {
+  return venueText ? `${venueText} / ${label}` : label;
+}
+
+function buildStartMessage(eventUrl: string, roundText?: string): string {
+  return roundText ? `เริ่มทำงานกับ ${eventUrl} / รอบ ${roundText}` : `เริ่มทำงานกับ ${eventUrl}`;
+}
+
+function buildStartedMessage(roundText?: string): string {
+  return roundText ? `เริ่มทำงานแล้ว ที่รอบ ${roundText}` : "เริ่มทำงานแล้ว";
+}
+
+function formatZoneSelectionStrategyLabel(strategy: SeatSelectionStrategy): string {
+  switch (strategy) {
+    case "closest-stage":
+      return "closest-stage";
+    case "center-most":
+      return "center-most";
+    case "front-left":
+      return "front-left";
+    case "front-right":
+      return "front-right";
+    case "back-left":
+      return "back-left";
+    case "back-right":
+      return "back-right";
+    default:
+      return "default";
+  }
+}
+
+function extractBalancedDivBlock(html: string, startIndex: number): string | null {
+  let depth = 0;
+  let cursor = startIndex;
+
+  while (cursor < html.length) {
+    const nextOpen = html.indexOf("<div", cursor);
+    const nextClose = html.indexOf("</div", cursor);
+
+    if (nextOpen === -1 && nextClose === -1) {
+      return null;
+    }
+
+    if (nextOpen !== -1 && (nextClose === -1 || nextOpen < nextClose)) {
+      const openEnd = html.indexOf(">", nextOpen);
+      if (openEnd === -1) {
+        return null;
+      }
+      depth += 1;
+      cursor = openEnd + 1;
+      continue;
+    }
+
+    const closeEnd = html.indexOf(">", nextClose);
+    if (closeEnd === -1) {
+      return null;
+    }
+    depth -= 1;
+    cursor = closeEnd + 1;
+    if (depth === 0) {
+      return html.slice(startIndex, cursor);
+    }
+  }
+
+  return null;
+}
+
+function extractDivBlocksByClass(html: string, className: string): string[] {
+  const blocks: string[] = [];
+  let searchFrom = 0;
+
+  while (searchFrom < html.length) {
+    const classIndex = html.indexOf(className, searchFrom);
+    if (classIndex === -1) {
+      break;
+    }
+
+    const divStart = html.lastIndexOf("<div", classIndex);
+    if (divStart === -1) {
+      break;
+    }
+
+    const block = extractBalancedDivBlock(html, divStart);
+    if (!block) {
+      searchFrom = classIndex + className.length;
+      continue;
+    }
+
+    blocks.push(block);
+    searchFrom = divStart + block.length;
+  }
+
+  return blocks;
+}
+
+function extractClassText(html: string, tagName: string, className: string): string {
+  const pattern = new RegExp(
+    String.raw`<${tagName}[^>]*class="[^"]*${className}[^"]*"[^>]*>([\s\S]*?)<\/${tagName}>`,
+    "i",
+  );
+  return decodeHtml(execPattern(pattern, html)?.[1] ?? "");
+}
+
+function extractRoundRowsFromItem(itemHtml: string): string[] {
+  return extractDivBlocksByClass(itemHtml, "row").filter(
+    (rowHtml) => rowHtml.includes("col-label") && rowHtml.includes("col-btn"),
+  );
+}
+
+function extractFallbackTextLines(html: string): string[] {
+  const withBreaks = html
+    .replaceAll(/<br\s*\/?>/gi, "\n")
+    .replaceAll(/<\/(?:div|p|li|tr|section|h[1-6]|td)>/gi, "\n");
+  const decoded = withBreaks
+    .replaceAll("&nbsp;", " ")
+    .replaceAll("&amp;", "&")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll(/<[^>]+>/g, " ")
+    .replaceAll(/[^\S\n]+/g, " ")
+    .replaceAll(/\n+/g, "\n");
+
+  return decoded
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
 
 type RunState = {
   state: "idle" | "running" | "done" | "error";
@@ -158,7 +323,7 @@ class TicketAssistBot {
     try {
       this.browser = await chromium.launch(launchOptions);
       this.updateStatus(`Launched browser with channel: ${browserChannel}`);
-    } catch (error) {
+    } catch {
       this.updateStatus(
         `Failed to launch channel ${browserChannel}, falling back to Playwright Chromium`,
       );
@@ -190,7 +355,8 @@ class TicketAssistBot {
       const rightUrl = new URL(right);
       return (
         leftUrl.origin === rightUrl.origin &&
-        leftUrl.pathname.replace(/\/+$/, "") === rightUrl.pathname.replace(/\/+$/, "")
+        leftUrl.pathname.replace(trailingSlashPattern, "") ===
+          rightUrl.pathname.replace(trailingSlashPattern, "")
       );
     } catch {
       return left === right;
@@ -283,7 +449,7 @@ class TicketAssistBot {
       await page
         .locator("#redirURL")
         .evaluate(
-          (node, value) => (((node as any).value = String(value)) as string),
+          (node, value) => ((node as any).value = String(value)),
           this.runtimeConfig.eventUrl,
         )
         .catch(() => undefined);
@@ -385,31 +551,14 @@ class TicketAssistBot {
   }
 
   private parseThaiSaleDateTime(text: string): number | null {
-    const normalized = text.replace(/\s+/g, " ").trim();
-    const match = normalized.match(
-      /วันเปิดจำหน่าย(?:บัตร)?\s*:?\s*วัน[^\d]*?(\d{1,2})\s+(มกราคม|กุมภาพันธ์|มีนาคม|เมษายน|พฤษภาคม|มิถุนายน|กรกฎาคม|สิงหาคม|กันยายน|ตุลาคม|พฤศจิกายน|ธันวาคม)\s+(\d{4}).{0,40}?(\d{1,2}):(\d{2})/i,
-    );
+    const normalized = text.replaceAll(/\s+/g, " ").trim();
+    const match = execPattern(saleDateTimePattern, normalized);
     if (!match) {
       return null;
     }
 
-    const monthMap: Record<string, number> = {
-      มกราคม: 0,
-      กุมภาพันธ์: 1,
-      มีนาคม: 2,
-      เมษายน: 3,
-      พฤษภาคม: 4,
-      มิถุนายน: 5,
-      กรกฎาคม: 6,
-      สิงหาคม: 7,
-      กันยายน: 8,
-      ตุลาคม: 9,
-      พฤศจิกายน: 10,
-      ธันวาคม: 11,
-    };
-
     const day = Number.parseInt(match[1], 10);
-    const month = monthMap[match[2]];
+    const month = thaiMonthIndex[match[2]];
     const buddhistYear = Number.parseInt(match[3], 10);
     const hour = Number.parseInt(match[4], 10);
     const minute = Number.parseInt(match[5], 10);
@@ -428,6 +577,16 @@ class TicketAssistBot {
     return new Date(year, month, day, hour, minute, 0, 0).getTime();
   }
 
+  private reportZoneOrder(strategy: SeatSelectionStrategy, zoneNames: string[]) {
+    if (!zoneNames.length) {
+      return;
+    }
+
+    this.updateStatus(
+      `Zone ranking strategy: ${formatZoneSelectionStrategyLabel(strategy)} | Trying zone candidates in order: ${zoneNames.join(", ")}`,
+    );
+  }
+
   private roundValueMatchesSignature(roundValue: string, signatureParts: string[]): boolean {
     const normalizedRoundValue = roundValue.trim().toLowerCase();
     if (!normalizedRoundValue) {
@@ -439,7 +598,7 @@ class TicketAssistBot {
     }
 
     const normalizedSignature = signatureParts.join(" ").toLowerCase();
-    const roundDataButton = normalizedRoundValue.match(/data-button["'=:\s]*([a-z0-9_-]+)/i)?.[1];
+    const roundDataButton = execPattern(dataButtonPattern, normalizedRoundValue)?.[1];
     if (roundDataButton && normalizedSignature.includes(roundDataButton.toLowerCase())) {
       return true;
     }
@@ -450,7 +609,7 @@ class TicketAssistBot {
       const desiredRdId = desiredUrl.searchParams.get("rdId");
 
       for (const part of signatureParts) {
-        const match = part.match(/https?:\/\/[^\s"'<>]+|\/booking\/[^\s"'<>]+/i);
+        const match = execPattern(bookingUrlPattern, part);
         const candidateRaw = match?.[0];
         if (!candidateRaw) {
           continue;
@@ -461,7 +620,8 @@ class TicketAssistBot {
           : new URL(candidateRaw, desiredUrl.origin);
 
         if (
-          candidateUrl.pathname.replace(/\/+$/, "") === desiredUrl.pathname.replace(/\/+$/, "") &&
+          candidateUrl.pathname.replace(trailingSlashPattern, "") ===
+            desiredUrl.pathname.replace(trailingSlashPattern, "") &&
           candidateUrl.searchParams.get("query") === desiredQuery &&
           (!desiredRdId || candidateUrl.searchParams.get("rdId") === desiredRdId)
         ) {
@@ -514,7 +674,12 @@ class TicketAssistBot {
       const signature = [
         (await action.getAttribute("onclick").catch(() => "")) ?? "",
         (await action.getAttribute("href").catch(() => "")) ?? "",
-        (await action.getAttribute("data-button").catch(() => "")) ?? "",
+        (await action
+          .evaluate((node) => {
+            const element = node as { dataset?: { button?: string } };
+            return element.dataset?.button ?? "";
+          })
+          .catch(() => "")) ?? "",
       ]
         .join(" ")
         .toLowerCase();
@@ -562,7 +727,7 @@ class TicketAssistBot {
 
     if (!matchedRow.isOpen) {
       this.updateStatus(
-        `Selected event is not open yet: ${matchedRow.venueText ? `${matchedRow.venueText} / ` : ""}${matchedRow.label}`,
+        `Selected event is not open yet: ${formatRoundSelectionLabel(matchedRow.venueText, matchedRow.label)}`,
       );
       return false;
     }
@@ -570,7 +735,7 @@ class TicketAssistBot {
     await matchedRow.action.click().catch(() => undefined);
     await page.waitForLoadState("domcontentloaded").catch(() => undefined);
     this.updateStatus(
-      `Selected performance round: ${matchedRow.venueText ? `${matchedRow.venueText} / ` : ""}${matchedRow.label}`,
+      `Selected performance round: ${formatRoundSelectionLabel(matchedRow.venueText, matchedRow.label)}`,
     );
     return true;
   }
@@ -585,13 +750,13 @@ class TicketAssistBot {
       if (matchedRound) {
         if (matchedRound.isOpen) {
           this.updateStatus(
-            `Selected event is open: ${matchedRound.venueText ? `${matchedRound.venueText} / ` : ""}${matchedRound.label}`,
+            `Selected event is open: ${formatRoundSelectionLabel(matchedRound.venueText, matchedRound.label)}`,
           );
           return "on_sale";
         }
 
         this.updateStatus(
-          `Waiting on event page for sale to open: ${matchedRound.venueText ? `${matchedRound.venueText} / ` : ""}${matchedRound.label}`,
+          `Waiting on event page for sale to open: ${formatRoundSelectionLabel(matchedRound.venueText, matchedRound.label)}`,
         );
       }
 
@@ -1377,6 +1542,8 @@ class TicketAssistBot {
         this.requirePage(),
         effectiveZoneTypePreference,
         [...this.exhaustedZoneNames],
+        this.runtimeConfig.seatSelectionStrategy,
+        (strategy, zoneNames) => this.reportZoneOrder(strategy, zoneNames),
       );
     }
 
@@ -1405,6 +1572,8 @@ class TicketAssistBot {
           this.requirePage(),
           "standing-only",
           [...this.exhaustedZoneNames],
+          this.runtimeConfig.seatSelectionStrategy,
+          (strategy, zoneNames) => this.reportZoneOrder(strategy, zoneNames),
         );
       }
     }
@@ -1439,6 +1608,7 @@ class TicketAssistBot {
       maxRetries: concertConfig.maxRetries,
       adjacentRetryRounds: 5,
       retryIntervalMs: concertConfig.retryIntervalMs,
+      onZoneOrder: (strategy, zoneNames) => this.reportZoneOrder(strategy, zoneNames),
     });
 
     if (!seatSelected) {
@@ -1495,7 +1665,7 @@ class TicketAssistBot {
     await page
       .locator("#verify_method")
       .evaluate(
-        (node, value) => (((node as any).value = String(value)) as string),
+        (node, value) => ((node as any).value = String(value)),
         method,
       )
       .catch(() => undefined);
@@ -1508,7 +1678,7 @@ class TicketAssistBot {
         await page
           .locator("#passport_country")
           .evaluate(
-            (node, value) => (((node as any).value = String(value)) as string),
+            (node, value) => ((node as any).value = String(value)),
             countryCode,
           )
           .catch(() => undefined);
@@ -2524,15 +2694,17 @@ const uiHtml = `<!doctype html>
     }
 
     function renderPreview() {
-      const verifySummary = verifyMethod.value === "thaiid"
-        ? (thaiId.value.trim() ? "Thai ID พร้อมกรอกอัตโนมัติ" : "Thai ID แต่ยังไม่ได้กรอกเลข")
-        : verifyMethod.value === "passport"
-          ? (
-            passportNumber.value.trim() && passportCountry.value.trim()
-              ? "Passport พร้อมกรอกอัตโนมัติ"
-              : "Passport แต่ข้อมูลยังไม่ครบ"
-          )
-          : "ถ้าเว็บถาม verify เพิ่ม ลูกค้าต้องกรอกเอง";
+      let verifySummary = "ถ้าเว็บถาม verify เพิ่ม ลูกค้าต้องกรอกเอง";
+      if (verifyMethod.value === "thaiid") {
+        verifySummary = thaiId.value.trim()
+          ? "Thai ID พร้อมกรอกอัตโนมัติ"
+          : "Thai ID แต่ยังไม่ได้กรอกเลข";
+      } else if (verifyMethod.value === "passport") {
+        verifySummary =
+          passportNumber.value.trim() && passportCountry.value.trim()
+            ? "Passport พร้อมกรอกอัตโนมัติ"
+            : "Passport แต่ข้อมูลยังไม่ครบ";
+      }
       const items = [
         ["Event URL", eventUrl.value.trim() || "-"],
         ["รอบที่เลือก", roundText.value.trim() || "-"],
@@ -2891,23 +3063,33 @@ function normalizeRunConfig(body: Record<string, unknown>): BotRunConfig {
     typeof body.seatSelectionStrategy === "string"
       ? body.seatSelectionStrategy.trim().toLowerCase()
       : "";
-  const seatSelectionStrategy: SeatSelectionStrategy =
+  let seatSelectionStrategy: SeatSelectionStrategy = "default";
+  if (
     rawSeatSelectionStrategy === "closest-stage" ||
     rawSeatSelectionStrategy === "center-most" ||
     rawSeatSelectionStrategy === "front-left" ||
     rawSeatSelectionStrategy === "front-right" ||
     rawSeatSelectionStrategy === "back-left" ||
     rawSeatSelectionStrategy === "back-right"
-      ? rawSeatSelectionStrategy
-      : rawSeatSelectionStrategy === "best"
-        ? "closest-stage"
-      : "default";
-  const ticketQuantity =
-    typeof body.ticketQuantity === "number"
-      ? Math.min(4, Math.max(1, Math.floor(body.ticketQuantity)))
-      : typeof body.ticketQuantity === "string" && body.ticketQuantity.trim()
-        ? Math.min(4, Math.max(1, Number.parseInt(body.ticketQuantity, 10) || 1))
-        : Math.min(4, Math.max(1, preferredSeats.length || concertConfig.maxTickets));
+  ) {
+    seatSelectionStrategy = rawSeatSelectionStrategy;
+  } else if (rawSeatSelectionStrategy === "best") {
+    seatSelectionStrategy = "closest-stage";
+  }
+
+  const fallbackTicketQuantity = Math.min(
+    4,
+    Math.max(1, preferredSeats.length || concertConfig.maxTickets),
+  );
+  let ticketQuantity = fallbackTicketQuantity;
+  if (typeof body.ticketQuantity === "number") {
+    ticketQuantity = Math.min(4, Math.max(1, Math.floor(body.ticketQuantity)));
+  } else if (typeof body.ticketQuantity === "string" && body.ticketQuantity.trim()) {
+    ticketQuantity = Math.min(
+      4,
+      Math.max(1, Number.parseInt(body.ticketQuantity, 10) || 1),
+    );
+  }
   const requireAdjacent = Boolean(body.requireAdjacent);
   const allowFallbackAny = Boolean(body.allowFallbackAny);
   const rawVerifyMethod =
@@ -2918,7 +3100,7 @@ function normalizeRunConfig(body: Record<string, unknown>): BotRunConfig {
       : undefined;
   const thaiId =
     typeof body.thaiId === "string" && body.thaiId.trim()
-      ? body.thaiId.replace(/\D+/g, "")
+      ? body.thaiId.replaceAll(/\D+/g, "")
       : undefined;
   const passportNumber =
     typeof body.passportNumber === "string" && body.passportNumber.trim()
@@ -2952,12 +3134,12 @@ function normalizeRunConfig(body: Record<string, unknown>): BotRunConfig {
 
 function decodeHtml(text: string): string {
   return text
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
+    .replaceAll("&nbsp;", " ")
+    .replaceAll("&amp;", "&")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll(/<[^>]+>/g, " ")
+    .replaceAll(/\s+/g, " ")
     .trim();
 }
 
@@ -2984,41 +3166,37 @@ function normalizeDateLabel(text: string): string {
   return text
     .replace(/^\s*วันที่แสดง\s*/i, "")
     .replace(/^\s*วันเปิดจำหน่าย\s*/i, "")
-    .replace(/\s+/g, " ")
+    .replaceAll(/\s+/g, " ")
     .trim();
 }
 
 function extractColLabelText(rowHtml: string): string {
-  const colLabelMatch = rowHtml.match(
-    /<div[^>]*class="[^"]*col-label[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<div[^>]*class="[^"]*col-btn[^"]*"/i,
-  );
+  const colLabelMatch = execPattern(colLabelPattern, rowHtml);
   if (!colLabelMatch) {
-    return "";
+    return normalizeDateLabel(extractClassText(rowHtml, "div", "date"));
   }
 
   return normalizeDateLabel(decodeHtml(colLabelMatch[1]));
 }
 
 function extractVenueText(itemHtml: string): string {
-  return decodeHtml(itemHtml.match(/<a[^>]*class="[^"]*venue[^"]*"[^>]*>([\s\S]*?)<\/a>/i)?.[1] ?? "");
+  return decodeHtml(execPattern(venueTextPattern, itemHtml)?.[1] ?? "");
 }
 
 function extractPriceText(itemHtml: string): string {
-  return decodeHtml(
-    itemHtml.match(/ราคาบัตร<\/small><br[^>]*>([\s\S]*?)<\/p>/i)?.[1] ?? "",
-  );
+  return decodeHtml(execPattern(priceTextPattern, itemHtml)?.[1] ?? "");
 }
 
 function extractRoundValue(rowHtml: string): string | undefined {
   const bookingUrl =
-    rowHtml.match(/popup\.signin\('([^']+booking[^']+)'\)/i)?.[1] ??
-    rowHtml.match(/onclick="[^"]*(https?:\/\/[^"]+booking[^"]+)"/i)?.[1] ??
-    rowHtml.match(/href="([^"]*(?:zones|queue|booking)\.php[^"]*)"/i)?.[1];
+    execPattern(popupSigninBookingPattern, rowHtml)?.[1] ??
+    execPattern(onclickBookingPattern, rowHtml)?.[1] ??
+    execPattern(hrefBookingPattern, rowHtml)?.[1];
   if (bookingUrl) {
     return bookingUrl.trim();
   }
 
-  const dataButton = rowHtml.match(/data-button="([^"]+)"/i)?.[1];
+  const dataButton = execPattern(dataButtonHtmlPattern, rowHtml)?.[1];
   if (dataButton) {
     return dataButton.trim();
   }
@@ -3027,24 +3205,18 @@ function extractRoundValue(rowHtml: string): string | undefined {
 }
 
 function extractRoundHints(html: string): RoundOption[] {
-  const eventItemPattern =
-    /<div[^>]*class="[^"]*event-detail-item[^"]*"[^>]*>([\s\S]*?)<\/div>\s*(?=<div[^>]*class="[^"]*event-detail-item[^"]*"|<!--\s*\/ EVENT ROUND|<\/div>\s*<\/section>)/gi;
-  const eventRowPattern =
-    /(<div[^>]*class="[^"]*row[^"]*"[^>]*>[\s\S]*?<div[^>]*class="[^"]*col-label[^"]*"[^>]*>[\s\S]*?<div[^>]*class="[^"]*date[^"]*"[^>]*>([\s\S]*?)<\/div>[\s\S]*?<div[^>]*class="[^"]*col-btn[^"]*"[^>]*>[\s\S]*?<span[^>]*class="[^"]*item-show[^"]*"[^>]*>([\s\S]*?)<\/span>[\s\S]*?<\/div>[\s\S]*?<\/div>)/gi;
-  const rowPattern =
-    /(<div[^>]*class="[^"]*date[^"]*"[^>]*>([\s\S]*?)<\/div>[\s\S]*?<div[^>]*class="[^"]*time[^"]*"[^>]*>([\s\S]*?)<\/div>)/gi;
   const rounds: RoundOption[] = [];
   const seen = new Set<string>();
 
-  for (const itemMatch of html.matchAll(eventItemPattern)) {
-    const itemHtml = itemMatch[1];
+  for (const itemHtml of extractDivBlocksByClass(html, "event-detail-item")) {
     const venueText = extractVenueText(itemHtml);
     const priceText = extractPriceText(itemHtml);
 
-    for (const rowMatch of itemHtml.matchAll(eventRowPattern)) {
-      const rowHtml = rowMatch[1];
-      const dateText = extractColLabelText(rowHtml) || decodeHtml(rowMatch[2]);
-      const timeText = decodeHtml(rowMatch[3]).match(/\b(?:[01]?\d|2[0-3]):[0-5]\d\b/)?.[0];
+    for (const rowHtml of extractRoundRowsFromItem(itemHtml)) {
+      const dateText = extractColLabelText(rowHtml);
+      const timeText =
+        extractTimeText(extractClassText(rowHtml, "span", "item-show")) ??
+        extractTimeText(extractClassText(rowHtml, "div", "time"));
       if (!dateText || !timeText || isSaleInfoLabel(dateText)) {
         continue;
       }
@@ -3069,9 +3241,9 @@ function extractRoundHints(html: string): RoundOption[] {
   }
 
   if (!rounds.length) {
-    for (const match of html.matchAll(rowPattern)) {
-      const dateText = normalizeDateLabel(decodeHtml(match[2]));
-      const timeText = decodeHtml(match[3]).match(/\b(?:[01]?\d|2[0-3]):[0-5]\d\b/)?.[0];
+    for (const rowHtml of extractDivBlocksByClass(html, "row")) {
+      const dateText = normalizeDateLabel(extractClassText(rowHtml, "div", "date"));
+      const timeText = extractTimeText(extractClassText(rowHtml, "div", "time"));
       if (!dateText || !timeText || isSaleInfoLabel(dateText)) {
         continue;
       }
@@ -3081,7 +3253,7 @@ function extractRoundHints(html: string): RoundOption[] {
         continue;
       }
       seen.add(label);
-      rounds.push({ dateText, timeText, label, isOpen: /buy|ซื้อบัตร/i.test(match[1]) });
+      rounds.push({ dateText, timeText, label, isOpen: /buy|ซื้อบัตร/i.test(rowHtml) });
     }
   }
 
@@ -3089,15 +3261,22 @@ function extractRoundHints(html: string): RoundOption[] {
     return rounds;
   }
 
-  const linePattern =
-    /(วัน[^<\n\r]{4,120}?)\s*(?:<\/[^>]+>\s*){0,3}.*?\b((?:[01]?\d|2[0-3]):[0-5]\d)\b/gi;
-  for (const match of html.matchAll(linePattern)) {
-    const dateText = normalizeDateLabel(decodeHtml(match[1]));
-    const timeText = match[2];
+  for (const line of extractFallbackTextLines(html)) {
+    if (!line.startsWith("วัน")) {
+      continue;
+    }
+
+    const timeText = extractTimeText(line);
+    if (!timeText) {
+      continue;
+    }
+
+    const dateText = normalizeDateLabel(line.replace(timeText, "").trim());
     const label = `${dateText} ${timeText}`.trim();
     if (!dateText || isSaleInfoLabel(dateText) || seen.has(label)) {
       continue;
     }
+
     seen.add(label);
     rounds.push({ dateText, timeText, label, isOpen: false });
   }
@@ -3113,11 +3292,12 @@ async function fetchRoundHints(eventUrl: string): Promise<RoundHintsResponse> {
   const html = await response.text();
   const rounds = extractRoundHints(html);
   const saleOpen = rounds.some((round) => round.isOpen);
-  const notice = rounds.length
-    ? saleOpen
+  let notice = "ไม่พบเวลารอบจากหน้า event ให้กรอกเองได้";
+  if (rounds.length) {
+    notice = saleOpen
       ? "กดเลือกเวลาที่ต้องการได้เลย"
-      : "มีช่วงเวลาแสดงตามรายการด้านล่าง แต่ยังไม่เปิดให้กดบัตร"
-    : "ไม่พบเวลารอบจากหน้า event ให้กรอกเองได้";
+      : "มีช่วงเวลาแสดงตามรายการด้านล่าง แต่ยังไม่เปิดให้กดบัตร";
+  }
   return { rounds, saleOpen, notice };
 }
 
@@ -3128,7 +3308,7 @@ function startBotRun(config: BotRunConfig) {
 
   runState = {
     state: "running",
-    message: `เริ่มทำงานกับ ${config.eventUrl}${config.roundText ? ` / รอบ ${config.roundText}` : ""}`,
+    message: buildStartMessage(config.eventUrl, config.roundText),
     config,
   };
 
@@ -3202,7 +3382,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       const config = normalizeRunConfig(body);
       startBotRun(config);
       json(res, 200, {
-        message: `เริ่มทำงานแล้ว${config.roundText ? ` ที่รอบ ${config.roundText}` : ""}`,
+        message: buildStartedMessage(config.roundText),
       });
     } catch (error) {
       json(res, 409, {
