@@ -22,12 +22,12 @@ type SeatCandidate = {
 };
 
 const unavailablePatterns = [
-  /coming\s*soon/i,
-  /temporarily\s*unavailable/i,
-  /not\s*available/i,
-  /หมด/i,
-  /ยังไม่เปิด/i,
-];
+  { label: "coming soon", pattern: /coming\s*soon/i },
+  { label: "temporarily unavailable", pattern: /temporarily\s*unavailable/i },
+  { label: "not available", pattern: /not\s*available/i },
+  { label: "หมด", pattern: /หมด/i },
+  { label: "ยังไม่เปิด", pattern: /ยังไม่เปิด/i },
+] as const;
 
 async function firstVisibleLocator(
   candidates: Locator[],
@@ -49,8 +49,13 @@ export async function readPageText(page: Page): Promise<string> {
 }
 
 export async function pageLooksUnavailable(page: Page): Promise<boolean> {
+  return Boolean(await findUnavailableReason(page));
+}
+
+export async function findUnavailableReason(page: Page): Promise<string | null> {
   const text = await readPageText(page);
-  return unavailablePatterns.some((pattern) => pattern.test(text));
+  const matched = unavailablePatterns.find(({ pattern }) => pattern.test(text));
+  return matched ? matched.label : null;
 }
 
 async function triggerImageMapZone(zoneOption: Locator): Promise<boolean> {

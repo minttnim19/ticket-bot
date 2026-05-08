@@ -1,11 +1,12 @@
 import { existsSync } from "fs";
-import { createServer, IncomingMessage, ServerResponse } from "http";
+import { createServer, IncomingMessage, ServerResponse, Server } from "http";
 import { Browser, BrowserContext, chromium, Page } from "playwright";
 import { concertConfig } from "./config";
 import { loadEnvFile } from "./env";
 import {
   chooseAnyZone,
   choosePreferredZone,
+  findUnavailableReason,
   pageLooksUnavailable,
   readPageText,
   retrySeatSelection,
@@ -84,6 +85,7 @@ class TicketAssistBot {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private lastSelectedZone: string | null = null;
+  private keepBrowserOpen = false;
 
   constructor(
     private readonly runtimeConfig: BotRunConfig,
@@ -975,7 +977,20 @@ class TicketAssistBot {
 
   async isZonePage(): Promise<boolean> {
     const page = this.requirePage();
-    return (await page.locator("#rdId").count()) > 0;
+    if ((await page.locator("#tableseats, #register_data, #btn_regnow").count()) > 0) {
+      return false;
+    }
+
+    const url = page.url();
+    if (/zones\.php/i.test(url)) {
+      return true;
+    }
+
+    if ((await page.locator(".zone-container, .select-zone").count()) > 0) {
+      return true;
+    }
+
+    return (await page.locator('map area[href*="#fixed.php#"], map area[href*="#festival.php#"]').count()) > 0;
   }
 
   async isSeatMapPage(): Promise<boolean> {
@@ -1236,7 +1251,10 @@ class TicketAssistBot {
 
   async handleAutoReviewPage() {
     if (concertConfig.stopBeforePayment) {
-      this.updateStatus("Reached review page. Stopping before payment confirmation.");
+      this.keepBrowserOpen = true;
+      this.updateStatus(
+        "Reached review page. Automation stopped before payment confirmation. Browser will stay open for manual payment.",
+      );
       return true;
     }
 
@@ -1259,10 +1277,6 @@ class TicketAssistBot {
     ) {
       this.updateStatus(`Seat flow attempt ${flowAttempt}/${concertConfig.maxFlowRetries}`);
 
-      if (await pageLooksUnavailable(this.requirePage())) {
-        throw new Error("Purchase page reports unavailable tickets");
-      }
-
       if (await this.recoverFromRoundResetErrorIfNeeded()) {
         continue;
       }
@@ -1282,6 +1296,21 @@ class TicketAssistBot {
       if (currentMode === "auto_queue") {
         await this.handleQueueIfPresent();
         currentMode = await this.classifyCurrentPage();
+      }
+
+      if (
+        currentMode === "auto_zone" ||
+        currentMode === "auto_quantity" ||
+        currentMode === "auto_seat" ||
+        currentMode === "auto_enroll" ||
+        currentMode === "auto_review"
+      ) {
+        const unavailableReason = await findUnavailableReason(this.requirePage());
+        if (unavailableReason) {
+          throw new Error(
+            `Purchase page reports unavailable tickets (${unavailableReason})`,
+          );
+        }
       }
 
       if (this.isManualPageMode(currentMode)) {
@@ -1342,17 +1371,17 @@ class TicketAssistBot {
         continue;
       }
 
-      if (await this.isZonePage()) {
+      const finalMode = await this.classifyCurrentPage();
+      if (this.isManualPageMode(finalMode)) {
+        await this.waitForManualPageResolution(finalMode);
+        continue;
+      }
+
+      if (finalMode === "auto_zone") {
         this.updateStatus("Returned to zone page after seat confirmation, retrying flow");
         await this.requirePage()
           .waitForTimeout(concertConfig.retryIntervalMs)
           .catch(() => undefined);
-        continue;
-      }
-
-      const finalMode = await this.classifyCurrentPage();
-      if (this.isManualPageMode(finalMode)) {
-        await this.waitForManualPageResolution(finalMode);
         continue;
       }
 
@@ -1370,6 +1399,10 @@ class TicketAssistBot {
   }
 
   async close() {
+    if (this.keepBrowserOpen) {
+      return;
+    }
+
     await this.context?.close().catch(() => undefined);
     await this.browser?.close().catch(() => undefined);
   }
@@ -2123,7 +2156,11 @@ const uiHtml = `<!doctype html>
         ticketQuantity.value = "4";
       }
 
-      const canStart = Boolean(roundText.value.trim()) && Number(ticketQuantity.value) > 0;
+      const isLocked = statusBadge.classList.contains("running");
+      const canStart =
+        !isLocked &&
+        Boolean(roundText.value.trim()) &&
+        Number(ticketQuantity.value) > 0;
       startJobButton.disabled = !canStart;
       startJobButton.style.opacity = canStart ? "1" : "0.5";
       startJobButton.style.cursor = canStart ? "pointer" : "not-allowed";
@@ -2197,6 +2234,13 @@ const uiHtml = `<!doctype html>
       statusBadge.textContent = badge.text;
       statusBadge.className = "status-badge " + badge.className;
       statusText.textContent = status.message;
+      if (status.state === "running") {
+        startJobButton.disabled = true;
+        startJobButton.style.opacity = "0.5";
+        startJobButton.style.cursor = "not-allowed";
+      } else {
+        updateStartButton();
+      }
     }
 
     function renderRoundOptions(items) {
@@ -2624,7 +2668,7 @@ async function fetchRoundHints(eventUrl: string): Promise<RoundHintsResponse> {
 
 function startBotRun(config: BotRunConfig) {
   if (runState.state === "running") {
-    throw new Error("มีงานที่กำลังรันอยู่แล้ว");
+    throw new Error("แอปรองรับการรันบอททีละ 1 งานเท่านั้น กรุณารอให้งานปัจจุบันจบก่อน");
   }
 
   runState = {
@@ -2647,7 +2691,9 @@ function startBotRun(config: BotRunConfig) {
       await bot.run();
       runState = {
         state: "done",
-        message: "งานจบรอบนี้แล้ว บอทหยุดก่อน payment ตาม config",
+        message: concertConfig.stopBeforePayment
+          ? "งานจบรอบนี้แล้ว บอทหยุดก่อน payment ตาม config และคง browser ไว้ให้ชำระเงินต่อเอง"
+          : "งานจบรอบนี้แล้ว",
         config,
       };
     } catch (error) {
@@ -2714,20 +2760,64 @@ async function route(req: IncomingMessage, res: ServerResponse) {
   json(res, 404, { error: "Not found" });
 }
 
-async function main() {
+type ControlServerHandle = {
+  server: Server;
+  host: string;
+  port: number;
+  url: string;
+  close: () => Promise<void>;
+};
+
+async function startControlServer(
+  requestedPort = Number(process.env.PORT || "3000"),
+  host = "127.0.0.1",
+): Promise<ControlServerHandle> {
   loadEnvFile();
-  const port = Number(process.env.PORT || "3000");
   const server = createServer((req, res) => {
     void route(req, res);
   });
 
-  server.listen(port, "127.0.0.1", () => {
-    console.log(`Control page: http://127.0.0.1:${port}`);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(requestedPort, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
   });
+
+  const address = server.address();
+  const port =
+    address && typeof address === "object"
+      ? address.port
+      : requestedPort;
+  const url = `http://${host}:${port}`;
+
+  console.log(`Control page: ${url}`);
+
+  return {
+    server,
+    host,
+    port,
+    url,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      }),
+  };
+}
+
+async function main() {
+  await startControlServer();
 }
 
 if (require.main === module) {
   void main();
 }
 
-export { TicketAssistBot, type BotRunConfig };
+export { TicketAssistBot, startControlServer, type BotRunConfig, type ControlServerHandle };

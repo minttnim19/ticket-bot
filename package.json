@@ -2,9 +2,14 @@
   "name": "ticket-bot",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "desktop/main.cjs",
   "scripts": {
     "start": "ts-node src/index.ts",
+    "desktop": "electron .",
+    "build": "tsc --outDir dist",
+    "desktop:build": "npm run build && electron-builder",
+    "desktop:build:mac": "npm run build && electron-builder --mac",
+    "desktop:build:win": "npm run build && electron-builder --win nsis --x64",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -16,7 +21,44 @@
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
+    "electron": "^37.1.0",
+    "electron-builder": "^25.1.8",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
+  },
+  "build": {
+    "appId": "com.ticketbot.desktop",
+    "productName": "Ticket Bot",
+    "directories": {
+      "output": "release"
+    },
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "files": [
+      "desktop/**/*",
+      "dist/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.utilities"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    }
   }
 }

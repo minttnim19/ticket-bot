@@ -8,6 +8,7 @@ pnpm-debug.log*
 # Build outputs
 dist/
 build/
+release/
 coverage/
 *.tsbuildinfo
 
@@ -15,6 +16,9 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# Local browser/session state
+.auth/
 
 # Logs and runtime
 logs/
