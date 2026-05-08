@@ -10,6 +10,7 @@ import {
   pageLooksUnavailable,
   readPageText,
   retrySeatSelection,
+  type SeatSelectionStrategy,
 } from "./seat";
 
 type TicketStatus =
@@ -33,6 +34,7 @@ type BotRunConfig = {
   attendeeNames: string[];
   zonePreference: string[];
   preferredSeats: string[];
+  seatSelectionStrategy: SeatSelectionStrategy;
   ticketQuantity: number;
   requireAdjacent: boolean;
   allowFallbackAny: boolean;
@@ -68,6 +70,7 @@ type StatusReporter = (message: string) => void;
 
 type PageMode =
   | "auto_round"
+  | "auto_terms"
   | "auto_zone"
   | "auto_quantity"
   | "auto_seat"
@@ -95,6 +98,17 @@ class TicketAssistBot {
   private updateStatus(message: string) {
     console.log(message);
     this.reportStatus?.(message);
+  }
+
+  private isDebugEnabled(): boolean {
+    return /^(1|true|yes|on)$/i.test(process.env.DEBUG ?? "");
+  }
+
+  private debugStatus(message: string) {
+    if (!this.isDebugEnabled()) {
+      return;
+    }
+    this.updateStatus(message);
   }
 
   private isManualPageMode(mode: PageMode): mode is ManualPageMode {
@@ -485,6 +499,25 @@ class TicketAssistBot {
     );
   }
 
+  async isVerifyConditionPage(): Promise<boolean> {
+    const page = this.requirePage();
+    const url = page.url();
+    if (/verify_condition\.php/i.test(url)) {
+      this.debugStatus(`verify_condition page detected by URL: ${url}`);
+      return true;
+    }
+
+    const checkboxCount = await page.locator("#rdagree, input[name='rdagree']").count();
+    const verifyButtonCount = await page.locator("#btn_verify").count();
+    if (checkboxCount > 0 || verifyButtonCount > 0) {
+      this.debugStatus(
+        `verify_condition element probe: rdagree=${checkboxCount}, btn_verify=${verifyButtonCount}, url=${url}`,
+      );
+    }
+
+    return checkboxCount > 0 && verifyButtonCount > 0;
+  }
+
   hasAutoVerifyProfile(): boolean {
     if (this.runtimeConfig.verifyMethod === "thaiid") {
       return Boolean(this.runtimeConfig.thaiId?.trim());
@@ -602,6 +635,10 @@ class TicketAssistBot {
       return "manual_login";
     }
 
+    if (await this.isVerifyConditionPage()) {
+      return "auto_terms";
+    }
+
     if (await this.isVerifyPage()) {
       return this.hasAutoVerifyProfile() ? "auto_verify" : "manual_unknown";
     }
@@ -643,6 +680,8 @@ class TicketAssistBot {
     switch (mode) {
       case "auto_round":
         return "Detected round selection page";
+      case "auto_terms":
+        return "Detected terms acceptance page";
       case "auto_zone":
         return "Detected zone selection page";
       case "auto_quantity":
@@ -782,6 +821,7 @@ class TicketAssistBot {
       }
 
       if (
+        mode === "auto_terms" ||
         mode === "auto_zone" ||
         mode === "auto_seat" ||
         mode === "auto_review"
@@ -977,7 +1017,9 @@ class TicketAssistBot {
 
   async isZonePage(): Promise<boolean> {
     const page = this.requirePage();
-    if ((await page.locator("#tableseats, #register_data, #btn_regnow").count()) > 0) {
+    if (
+      (await page.locator("#tableseats, #register_data, #btn_regnow, #rdagree, #btn_verify").count()) > 0
+    ) {
       return false;
     }
 
@@ -1066,6 +1108,52 @@ class TicketAssistBot {
     return this.waitForPostRoundTransition();
   }
 
+  async handleAutoTermsPage() {
+    const page = this.requirePage();
+    const agreeCheckbox = page.locator("#rdagree, input[name='rdagree']").first();
+    const verifyButton = page.locator("#btn_verify").first();
+    const checkboxCount = await page.locator("#rdagree, input[name='rdagree']").count();
+    const verifyButtonCount = await page.locator("#btn_verify").count();
+
+    this.debugStatus(
+      `Terms page controls: rdagree=${checkboxCount}, btn_verify=${verifyButtonCount}, url=${page.url()}`,
+    );
+
+    if (!(await agreeCheckbox.count()) || !(await verifyButton.count())) {
+      throw new Error("Terms page is missing acceptance controls");
+    }
+
+    await agreeCheckbox.scrollIntoViewIfNeeded().catch(() => undefined);
+    await agreeCheckbox.evaluate((node) => {
+      const input = node as {
+        checked: boolean;
+        dispatchEvent: (event: Event) => boolean;
+      };
+      input.checked = true;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.dispatchEvent(new Event("click", { bubbles: true }));
+    });
+    const isChecked = await agreeCheckbox
+      .evaluate((node) => Boolean((node as { checked?: boolean }).checked))
+      .catch(() => false);
+    this.debugStatus(`Accepted event terms and conditions (checked=${String(isChecked)})`);
+
+    const currentUrl = page.url();
+    await verifyButton.scrollIntoViewIfNeeded().catch(() => undefined);
+    await verifyButton.click({ force: true }).catch(async () => {
+      await verifyButton.evaluate((node) => {
+        (node as { click: () => void }).click();
+      });
+    });
+    this.debugStatus(`Clicked Buy Ticket on terms page from url=${currentUrl}`);
+    await Promise.race([
+      page.waitForURL((url) => url.toString() !== currentUrl, { timeout: 5_000 }),
+      page.waitForLoadState("domcontentloaded"),
+    ]).catch(() => undefined);
+    this.debugStatus(`Submitted terms acceptance, current url=${page.url()}`);
+  }
+
   async handleAutoZonePage() {
     await this.ensureZonePageReady();
 
@@ -1101,6 +1189,7 @@ class TicketAssistBot {
       currentZoneHint: this.lastSelectedZone ?? undefined,
       seatRowPreference: concertConfig.seatRowPreference,
       preferredSeats: this.runtimeConfig.preferredSeats,
+      seatSelectionStrategy: this.runtimeConfig.seatSelectionStrategy,
       desiredSeatCount: this.runtimeConfig.ticketQuantity,
       requireAdjacent: this.runtimeConfig.requireAdjacent,
       allowFallbackAnySeat: this.runtimeConfig.allowFallbackAny,
@@ -1187,7 +1276,13 @@ class TicketAssistBot {
       }
     }
 
-    await page.locator("#btnconfirm").click().catch(() => undefined);
+    const verifySubmitButton = page.locator("#btnconfirm").first();
+    await verifySubmitButton.scrollIntoViewIfNeeded().catch(() => undefined);
+    await verifySubmitButton.click({ force: true }).catch(async () => {
+      await verifySubmitButton.evaluate((node) => {
+        (node as { click: () => void }).click();
+      });
+    });
     await page.waitForLoadState("domcontentloaded").catch(() => undefined);
     this.updateStatus("Submitted identity verification form");
     return true;
@@ -1243,7 +1338,13 @@ class TicketAssistBot {
 
     this.updateStatus(`Filled attendee details for ${attendeeNames.length} ticket holder(s)`);
 
-    await page.locator("#btn_regnow").click().catch(() => undefined);
+    const enrollSubmitButton = page.locator("#btn_regnow").first();
+    await enrollSubmitButton.scrollIntoViewIfNeeded().catch(() => undefined);
+    await enrollSubmitButton.click({ force: true }).catch(async () => {
+      await enrollSubmitButton.evaluate((node) => {
+        (node as { click: () => void }).click();
+      });
+    });
     await page.waitForLoadState("domcontentloaded").catch(() => undefined);
     this.updateStatus("Submitted attendee details form");
     return true;
@@ -1319,6 +1420,11 @@ class TicketAssistBot {
 
       if (currentMode === "auto_round") {
         await this.handleAutoRoundPage();
+        currentMode = await this.classifyCurrentPage();
+      }
+
+      if (currentMode === "auto_terms") {
+        await this.handleAutoTermsPage();
         currentMode = await this.classifyCurrentPage();
       }
 
@@ -1986,6 +2092,18 @@ const uiHtml = `<!doctype html>
                 <input id="preferredSeats" type="text" placeholder="เช่น G-49, G-50" />
               </label>
             </div>
+            <label>
+              ลำดับการเลือกที่นั่งเมื่อไม่ได้ระบุเลขที่นั่ง
+              <select id="seatSelectionStrategy">
+                <option value="default">ใช้ลำดับเดิมของระบบ</option>
+                <option value="closest-stage">ใกล้เวทีที่สุด</option>
+                <option value="center-most">กลางสุด</option>
+                <option value="front-left">ข้างหน้าซ้ายไปขวา</option>
+                <option value="front-right">ข้างหน้าขวาไปซ้าย</option>
+                <option value="back-left">ข้างหลังซ้ายไปขวา</option>
+                <option value="back-right">ข้างหลังขวาไปซ้าย</option>
+              </select>
+            </label>
             <div>
               <div class="section-copy" style="margin-bottom:12px;">ชื่อบนบัตรจะสร้างตามจำนวนบัตร และใช้กรอกในหน้า register อัตโนมัติถ้ากรอกมาครบ</div>
               <div id="ticketHolderFields" class="ticket-holder-list"></div>
@@ -2065,6 +2183,7 @@ const uiHtml = `<!doctype html>
     const ticketQuantity = document.getElementById("ticketQuantity");
     const zonePreference = document.getElementById("zonePreference");
     const preferredSeats = document.getElementById("preferredSeats");
+    const seatSelectionStrategy = document.getElementById("seatSelectionStrategy");
     const verifyMethod = document.getElementById("verifyMethod");
     const thaiId = document.getElementById("thaiId");
     const passportNumber = document.getElementById("passportNumber");
@@ -2134,6 +2253,17 @@ const uiHtml = `<!doctype html>
         ["จำนวนบัตร", ticketQuantity.value || "1"],
         ["Preferred zones", zonePreference.value.trim() || "ให้ระบบเลือกตามที่หาได้"],
         ["Preferred seats", preferredSeats.value.trim() || "ไม่ได้ล็อกที่นั่งเฉพาะ"],
+        ["ลำดับเลือกที่นั่ง", preferredSeats.value.trim()
+          ? "ข้าม เพราะระบุเลขที่นั่งไว้แล้ว"
+          : ({
+              "default": "ใช้ลำดับเดิมของระบบ",
+              "closest-stage": "ใกล้เวทีที่สุด",
+              "center-most": "กลางสุด",
+              "front-left": "ข้างหน้าซ้ายไปขวา",
+              "front-right": "ข้างหน้าขวาไปซ้าย",
+              "back-left": "ข้างหลังซ้ายไปขวา",
+              "back-right": "ข้างหลังขวาไปซ้าย"
+            }[seatSelectionStrategy.value] || "ใช้ลำดับเดิมของระบบ")],
         ["ที่นั่งติดกัน", requireAdjacent.checked ? "ต้องติดกัน" : "ไม่บังคับติดกัน"],
         ["Fallback", allowFallbackAny.checked ? "ยอมเปลี่ยนโซน/ที่นั่งได้" : "ยึดตาม preference ก่อน"],
         ["Verify", verifySummary],
@@ -2322,6 +2452,7 @@ const uiHtml = `<!doctype html>
           ticketQuantity: ticketQuantity.value,
           zonePreference: zonePreference.value,
           preferredSeats: preferredSeats.value,
+          seatSelectionStrategy: seatSelectionStrategy.value,
           verifyMethod: verifyMethod.value,
           thaiId: thaiId.value,
           passportNumber: passportNumber.value,
@@ -2346,6 +2477,7 @@ const uiHtml = `<!doctype html>
     loginUsername.addEventListener("input", renderPreview);
     loginPassword.addEventListener("input", renderPreview);
     zonePreference.addEventListener("input", renderPreview);
+    seatSelectionStrategy.addEventListener("change", renderPreview);
     verifyMethod.addEventListener("change", renderPreview);
     thaiId.addEventListener("input", renderPreview);
     passportNumber.addEventListener("input", renderPreview);
@@ -2449,6 +2581,21 @@ function normalizeRunConfig(body: Record<string, unknown>): BotRunConfig {
           .map((item) => item.trim().toUpperCase())
           .filter(Boolean)
       : [];
+  const rawSeatSelectionStrategy =
+    typeof body.seatSelectionStrategy === "string"
+      ? body.seatSelectionStrategy.trim().toLowerCase()
+      : "";
+  const seatSelectionStrategy: SeatSelectionStrategy =
+    rawSeatSelectionStrategy === "closest-stage" ||
+    rawSeatSelectionStrategy === "center-most" ||
+    rawSeatSelectionStrategy === "front-left" ||
+    rawSeatSelectionStrategy === "front-right" ||
+    rawSeatSelectionStrategy === "back-left" ||
+    rawSeatSelectionStrategy === "back-right"
+      ? rawSeatSelectionStrategy
+      : rawSeatSelectionStrategy === "best"
+        ? "closest-stage"
+      : "default";
   const ticketQuantity =
     typeof body.ticketQuantity === "number"
       ? Math.min(4, Math.max(1, Math.floor(body.ticketQuantity)))
@@ -2485,6 +2632,7 @@ function normalizeRunConfig(body: Record<string, unknown>): BotRunConfig {
     loginPassword,
     zonePreference,
     preferredSeats,
+    seatSelectionStrategy,
     ticketQuantity,
     requireAdjacent,
     allowFallbackAny,

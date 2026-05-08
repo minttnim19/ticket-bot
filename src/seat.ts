@@ -5,6 +5,7 @@ export type SeatRetryOptions = {
   currentZoneHint?: string;
   seatRowPreference?: string[];
   preferredSeats?: string[];
+  seatSelectionStrategy?: SeatSelectionStrategy;
   desiredSeatCount: number;
   requireAdjacent: boolean;
   allowFallbackAnySeat: boolean;
@@ -14,8 +15,18 @@ export type SeatRetryOptions = {
   retryIntervalMs: number;
 };
 
+export type SeatSelectionStrategy =
+  | "default"
+  | "closest-stage"
+  | "center-most"
+  | "front-left"
+  | "front-right"
+  | "back-left"
+  | "back-right";
+
 type SeatCandidate = {
   row: string;
+  rowOrder: number;
   number: number;
   locatorSelector: string;
   label: string;
@@ -249,6 +260,7 @@ async function collectSeatCandidates(page: Page): Promise<SeatCandidate[]> {
   const cells = page.locator("#tableseats td[title]:not(.not-available)");
   const count = await cells.count();
   const seats: SeatCandidate[] = [];
+  const rowOrderByName = new Map<string, number>();
 
   for (let index = 0; index < count; index += 1) {
     const cell = cells.nth(index);
@@ -272,8 +284,13 @@ async function collectSeatCandidates(page: Page): Promise<SeatCandidate[]> {
       continue;
     }
 
+    if (!rowOrderByName.has(parsed.row)) {
+      rowOrderByName.set(parsed.row, rowOrderByName.size);
+    }
+
     seats.push({
       row: parsed.row,
+      rowOrder: rowOrderByName.get(parsed.row) ?? 0,
       number: parsed.number,
       locatorSelector: `#${seatId}`,
       label: `${parsed.row}-${parsed.number}`,
@@ -307,24 +324,265 @@ function pickExactSeats(
   return picked.length === normalized.length ? picked : null;
 }
 
-function pickAdjacentSeats(
+function isFrontToBack(strategy: SeatSelectionStrategy): boolean {
+  return strategy === "front-left" || strategy === "front-right";
+}
+
+function isLeftToRight(strategy: SeatSelectionStrategy): boolean {
+  return strategy === "front-left" || strategy === "back-left";
+}
+
+function buildRowSequence(
+  seats: SeatCandidate[],
+  rowPreference: string[],
+  strategy: SeatSelectionStrategy,
+): string[] {
+  if (strategy === "default") {
+    return rowPreference.length
+      ? rowPreference
+      : [...new Set(seats.map((seat) => seat.row))];
+  }
+
+  const uniqueRows = [...new Map(seats.map((seat) => [seat.row, seat.rowOrder])).entries()]
+    .sort((left, right) =>
+      isFrontToBack(strategy) ? left[1] - right[1] : right[1] - left[1],
+    )
+    .map(([row]) => row);
+
+  return uniqueRows;
+}
+
+function sortSeatsInRow(
+  seats: SeatCandidate[],
+  strategy: SeatSelectionStrategy,
+): SeatCandidate[] {
+  const direction = isLeftToRight(strategy) ? 1 : -1;
+  return seats.sort((left, right) => direction * (left.number - right.number));
+}
+
+function buildRowCenterMap(seats: SeatCandidate[]): Map<string, number> {
+  const rowBounds = new Map<string, { min: number; max: number }>();
+  for (const seat of seats) {
+    const current = rowBounds.get(seat.row);
+    if (!current) {
+      rowBounds.set(seat.row, { min: seat.number, max: seat.number });
+      continue;
+    }
+    current.min = Math.min(current.min, seat.number);
+    current.max = Math.max(current.max, seat.number);
+  }
+
+  return new Map(
+    [...rowBounds.entries()].map(([row, bounds]) => [row, (bounds.min + bounds.max) / 2]),
+  );
+}
+
+function getRowCenter(rowCenters: Map<string, number>, row: string): number {
+  return rowCenters.get(row) ?? Number.POSITIVE_INFINITY;
+}
+
+function compareClosestStageSeatCandidates(
+  left: SeatCandidate,
+  right: SeatCandidate,
+  rowCenters: Map<string, number>,
+): number {
+  if (left.rowOrder !== right.rowOrder) {
+    return left.rowOrder - right.rowOrder;
+  }
+
+  const leftCenterDistance = Math.abs(left.number - getRowCenter(rowCenters, left.row));
+  const rightCenterDistance = Math.abs(right.number - getRowCenter(rowCenters, right.row));
+  if (leftCenterDistance !== rightCenterDistance) {
+    return leftCenterDistance - rightCenterDistance;
+  }
+
+  if (left.number !== right.number) {
+    return left.number - right.number;
+  }
+
+  return left.label.localeCompare(right.label);
+}
+
+function compareCenterMostSeatCandidates(
+  left: SeatCandidate,
+  right: SeatCandidate,
+  rowCenters: Map<string, number>,
+): number {
+  const leftCenterDistance = Math.abs(left.number - getRowCenter(rowCenters, left.row));
+  const rightCenterDistance = Math.abs(right.number - getRowCenter(rowCenters, right.row));
+  if (leftCenterDistance !== rightCenterDistance) {
+    return leftCenterDistance - rightCenterDistance;
+  }
+
+  if (left.rowOrder !== right.rowOrder) {
+    return left.rowOrder - right.rowOrder;
+  }
+
+  if (left.number !== right.number) {
+    return left.number - right.number;
+  }
+
+  return left.label.localeCompare(right.label);
+}
+
+function pickClosestStageAdjacentSeats(
   seats: SeatCandidate[],
   desiredSeatCount: number,
-  rowPreference: string[],
 ): SeatCandidate[] | null {
-  const sortedRows = rowPreference.length
-    ? rowPreference
-    : [...new Set(seats.map((seat) => seat.row))];
+  const rowCenters = buildRowCenterMap(seats);
+  const rows = [...new Map(seats.map((seat) => [seat.row, seat.rowOrder])).entries()]
+    .sort((left, right) => left[1] - right[1])
+    .map(([row]) => row);
 
-  for (const row of sortedRows) {
-    const rowSeats = seats
+  let bestSlice: SeatCandidate[] | null = null;
+  let bestScore:
+    | {
+        rowOrder: number;
+        centerDistance: number;
+        blockStart: number;
+      }
+    | null = null;
+
+  for (const row of rows) {
+    const rowSeats = [...seats]
       .filter((seat) => seat.row === row)
       .sort((left, right) => left.number - right.number);
 
     for (let index = 0; index <= rowSeats.length - desiredSeatCount; index += 1) {
       const slice = rowSeats.slice(index, index + desiredSeatCount);
       const isAdjacent = slice.every((seat, seatIndex) =>
-        seatIndex === 0 ? true : seat.number === slice[seatIndex - 1].number + 1,
+        seatIndex === 0 ? true : slice[seatIndex - 1].number + 1 === seat.number,
+      );
+      if (!isAdjacent) {
+        continue;
+      }
+
+      const blockCenter = (slice[0].number + slice[slice.length - 1].number) / 2;
+      const score = {
+        rowOrder: slice[0].rowOrder,
+        centerDistance: Math.abs(blockCenter - getRowCenter(rowCenters, row)),
+        blockStart: slice[0].number,
+      };
+
+      if (
+        !bestScore ||
+        score.rowOrder < bestScore.rowOrder ||
+        (score.rowOrder === bestScore.rowOrder &&
+          (score.centerDistance < bestScore.centerDistance ||
+            (score.centerDistance === bestScore.centerDistance &&
+              score.blockStart < bestScore.blockStart)))
+      ) {
+        bestSlice = slice;
+        bestScore = score;
+      }
+    }
+  }
+
+  return bestSlice;
+}
+
+function pickCenterMostAdjacentSeats(
+  seats: SeatCandidate[],
+  desiredSeatCount: number,
+): SeatCandidate[] | null {
+  const rowCenters = buildRowCenterMap(seats);
+  const rows = [...new Map(seats.map((seat) => [seat.row, seat.rowOrder])).entries()]
+    .sort((left, right) => left[1] - right[1])
+    .map(([row]) => row);
+
+  let bestSlice: SeatCandidate[] | null = null;
+  let bestScore:
+    | {
+        centerDistance: number;
+        rowOrder: number;
+        blockStart: number;
+      }
+    | null = null;
+
+  for (const row of rows) {
+    const rowSeats = [...seats]
+      .filter((seat) => seat.row === row)
+      .sort((left, right) => left.number - right.number);
+
+    for (let index = 0; index <= rowSeats.length - desiredSeatCount; index += 1) {
+      const slice = rowSeats.slice(index, index + desiredSeatCount);
+      const isAdjacent = slice.every((seat, seatIndex) =>
+        seatIndex === 0 ? true : slice[seatIndex - 1].number + 1 === seat.number,
+      );
+      if (!isAdjacent) {
+        continue;
+      }
+
+      const blockCenter = (slice[0].number + slice[slice.length - 1].number) / 2;
+      const score = {
+        centerDistance: Math.abs(blockCenter - getRowCenter(rowCenters, row)),
+        rowOrder: slice[0].rowOrder,
+        blockStart: slice[0].number,
+      };
+
+      if (
+        !bestScore ||
+        score.centerDistance < bestScore.centerDistance ||
+        (score.centerDistance === bestScore.centerDistance &&
+          (score.rowOrder < bestScore.rowOrder ||
+            (score.rowOrder === bestScore.rowOrder &&
+              score.blockStart < bestScore.blockStart)))
+      ) {
+        bestSlice = slice;
+        bestScore = score;
+      }
+    }
+  }
+
+  return bestSlice;
+}
+
+function pickClosestStageSeatSet(
+  seats: SeatCandidate[],
+  desiredSeatCount: number,
+): SeatCandidate[] | null {
+  const rowCenters = buildRowCenterMap(seats);
+  return [...seats]
+    .sort((left, right) => compareClosestStageSeatCandidates(left, right, rowCenters))
+    .slice(0, desiredSeatCount);
+}
+
+function pickCenterMostSeatSet(
+  seats: SeatCandidate[],
+  desiredSeatCount: number,
+): SeatCandidate[] | null {
+  const rowCenters = buildRowCenterMap(seats);
+  return [...seats]
+    .sort((left, right) => compareCenterMostSeatCandidates(left, right, rowCenters))
+    .slice(0, desiredSeatCount);
+}
+
+function pickAdjacentSeats(
+  seats: SeatCandidate[],
+  desiredSeatCount: number,
+  rowPreference: string[],
+  strategy: SeatSelectionStrategy,
+): SeatCandidate[] | null {
+  if (strategy === "closest-stage") {
+    return pickClosestStageAdjacentSeats(seats, desiredSeatCount);
+  }
+
+  if (strategy === "center-most") {
+    return pickCenterMostAdjacentSeats(seats, desiredSeatCount);
+  }
+
+  const sortedRows = buildRowSequence(seats, rowPreference, strategy);
+
+  for (const row of sortedRows) {
+    const rowSeats = sortSeatsInRow(
+      seats.filter((seat) => seat.row === row),
+      strategy,
+    );
+
+    for (let index = 0; index <= rowSeats.length - desiredSeatCount; index += 1) {
+      const slice = rowSeats.slice(index, index + desiredSeatCount);
+      const isAdjacent = slice.every((seat, seatIndex) =>
+        seatIndex === 0 ? true : Math.abs(seat.number - slice[seatIndex - 1].number) === 1,
       );
       if (isAdjacent) {
         return slice;
@@ -339,23 +597,29 @@ function pickSeatsByPreference(
   seats: SeatCandidate[],
   desiredSeatCount: number,
   rowPreference: string[],
+  strategy: SeatSelectionStrategy,
 ): SeatCandidate[] | null {
-  const rows = rowPreference.length
-    ? rowPreference
-    : [...new Set(seats.map((seat) => seat.row))];
+  if (strategy === "closest-stage") {
+    return pickClosestStageSeatSet(seats, desiredSeatCount);
+  }
+
+  if (strategy === "center-most") {
+    return pickCenterMostSeatSet(seats, desiredSeatCount);
+  }
+
+  const rows = buildRowSequence(seats, rowPreference, strategy);
 
   for (const row of rows) {
-    const rowSeats = seats
-      .filter((seat) => seat.row === row)
-      .sort((left, right) => left.number - right.number);
+    const rowSeats = sortSeatsInRow(
+      seats.filter((seat) => seat.row === row),
+      strategy,
+    );
     if (rowSeats.length >= desiredSeatCount) {
       return rowSeats.slice(0, desiredSeatCount);
     }
   }
 
-  return seats
-    .sort((left, right) => left.number - right.number)
-    .slice(0, desiredSeatCount);
+  return sortSeatsInRow([...seats], strategy).slice(0, desiredSeatCount);
 }
 
 export async function selectSeatSet(
@@ -366,6 +630,7 @@ export async function selectSeatSet(
     | "desiredSeatCount"
     | "requireAdjacent"
     | "seatRowPreference"
+    | "seatSelectionStrategy"
     | "allowFallbackAnySeat"
   >,
 ): Promise<boolean> {
@@ -376,6 +641,7 @@ export async function selectSeatSet(
 
   const desiredCount = Math.max(1, options.desiredSeatCount);
   const preferredRows = options.seatRowPreference ?? [];
+  const selectionStrategy = options.seatSelectionStrategy ?? "default";
 
   const exactSeats = pickExactSeats(seats, options.preferredSeats ?? []);
   if (exactSeats && exactSeats.length >= desiredCount) {
@@ -383,14 +649,24 @@ export async function selectSeatSet(
   }
 
   if (options.requireAdjacent && desiredCount > 1) {
-    const adjacent = pickAdjacentSeats(seats, desiredCount, preferredRows);
+    const adjacent = pickAdjacentSeats(
+      seats,
+      desiredCount,
+      preferredRows,
+      selectionStrategy,
+    );
     if (adjacent) {
       return clickSeatSet(page, adjacent);
     }
     return false;
   }
 
-  const preferredSet = pickSeatsByPreference(seats, desiredCount, preferredRows);
+  const preferredSet = pickSeatsByPreference(
+    seats,
+    desiredCount,
+    preferredRows,
+    selectionStrategy,
+  );
   if (preferredSet && preferredSet.length === desiredCount) {
     return clickSeatSet(page, preferredSet);
   }
@@ -440,6 +716,7 @@ export async function retrySeatSelection(
       desiredSeatCount: options.desiredSeatCount,
       requireAdjacent: options.requireAdjacent,
       seatRowPreference: options.seatRowPreference,
+      seatSelectionStrategy: options.seatSelectionStrategy,
       allowFallbackAnySeat: options.allowFallbackAnySeat,
     });
 

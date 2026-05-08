@@ -11,12 +11,28 @@ if (!gotSingleInstanceLock) {
 
 function loadServerModule() {
   const compiledPath = path.join(__dirname, "..", "dist", "index.js");
+  const sourcePath = path.join(__dirname, "..", "src", "index.ts");
+
+  if (!app.isPackaged) {
+    try {
+      require("ts-node/register");
+      return require(sourcePath);
+    } catch (sourceError) {
+      try {
+        return require(compiledPath);
+      } catch (compiledError) {
+        sourceError.cause = compiledError;
+        throw sourceError;
+      }
+    }
+  }
+
   try {
     return require(compiledPath);
   } catch (compiledError) {
     try {
       require("ts-node/register");
-      return require(path.join(__dirname, "..", "src", "index.ts"));
+      return require(sourcePath);
     } catch (sourceError) {
       sourceError.cause = compiledError;
       throw sourceError;
