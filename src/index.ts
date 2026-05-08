@@ -4,6 +4,7 @@ import { Browser, BrowserContext, chromium, Page } from "playwright";
 import { concertConfig } from "./config";
 import { loadEnvFile } from "./env";
 import {
+  countSelectableZones,
   chooseAnyZone,
   choosePreferredZone,
   findUnavailableReason,
@@ -11,6 +12,7 @@ import {
   readPageText,
   retrySeatSelection,
   type SeatSelectionStrategy,
+  type ZoneTypePreference,
 } from "./seat";
 
 type TicketStatus =
@@ -33,6 +35,7 @@ type BotRunConfig = {
   loginPassword?: string;
   attendeeNames: string[];
   zonePreference: string[];
+  zoneTypePreference: ZoneTypePreference;
   preferredSeats: string[];
   seatSelectionStrategy: SeatSelectionStrategy;
   ticketQuantity: number;
@@ -88,6 +91,8 @@ class TicketAssistBot {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private lastSelectedZone: string | null = null;
+  private readonly exhaustedZoneNames = new Set<string>();
+  private standingFallbackEnabled = false;
   private keepBrowserOpen = false;
 
   constructor(
@@ -113,6 +118,33 @@ class TicketAssistBot {
 
   private isManualPageMode(mode: PageMode): mode is ManualPageMode {
     return mode.startsWith("manual_");
+  }
+
+  private getEffectiveZoneTypePreference(): ZoneTypePreference {
+    if (this.runtimeConfig.zoneTypePreference !== "both") {
+      return this.runtimeConfig.zoneTypePreference;
+    }
+
+    return this.standingFallbackEnabled ? "standing-only" : "seating-only";
+  }
+
+  private async estimateZoneAttemptLimit(): Promise<number | null> {
+    if (!(await this.isZonePage())) {
+      return null;
+    }
+
+    const page = this.requirePage();
+    const usePreferredOnly =
+      this.runtimeConfig.zonePreference.length > 0 && !this.runtimeConfig.allowFallbackAny;
+    const preferredZones = usePreferredOnly ? this.runtimeConfig.zonePreference : [];
+
+    if (this.runtimeConfig.zoneTypePreference === "both" && !this.standingFallbackEnabled) {
+      const seatingCount = await countSelectableZones(page, "seating-only", preferredZones);
+      const standingCount = await countSelectableZones(page, "standing-only", preferredZones);
+      return seatingCount + standingCount;
+    }
+
+    return countSelectableZones(page, this.getEffectiveZoneTypePreference(), preferredZones);
   }
 
   async init() {
@@ -152,10 +184,26 @@ class TicketAssistBot {
     return this.page;
   }
 
-  async navigateToEvent() {
+  private isSameUrlPath(left: string, right: string): boolean {
+    try {
+      const leftUrl = new URL(left);
+      const rightUrl = new URL(right);
+      return (
+        leftUrl.origin === rightUrl.origin &&
+        leftUrl.pathname.replace(/\/+$/, "") === rightUrl.pathname.replace(/\/+$/, "")
+      );
+    } catch {
+      return left === right;
+    }
+  }
+
+  async navigateToEvent(force = false) {
     const page = this.requirePage();
+    if (!force && this.isSameUrlPath(page.url(), this.runtimeConfig.eventUrl)) {
+      this.updateStatus(`Already on event page: ${this.runtimeConfig.eventUrl}`);
+      return;
+    }
     await page.goto(this.runtimeConfig.eventUrl, { waitUntil: "domcontentloaded" });
-    await page.waitForLoadState("networkidle").catch(() => undefined);
     this.updateStatus(`Opened event page: ${this.runtimeConfig.eventUrl}`);
   }
 
@@ -164,7 +212,6 @@ class TicketAssistBot {
     await page.goto("https://www.thaiticketmajor.com/index.html", {
       waitUntil: "domcontentloaded",
     });
-    await page.waitForLoadState("networkidle").catch(() => undefined);
     this.updateStatus("Opened Thaiticketmajor homepage");
   }
 
@@ -204,7 +251,6 @@ class TicketAssistBot {
   async openSigninPage() {
     const page = this.requirePage();
     await page.goto(this.getSigninUrl(), { waitUntil: "domcontentloaded" });
-    await page.waitForLoadState("networkidle").catch(() => undefined);
     this.updateStatus("Opened signin page");
   }
 
@@ -246,7 +292,7 @@ class TicketAssistBot {
     this.updateStatus("Submitting stored login credentials");
     await submitButton.click().catch(() => undefined);
     await page.waitForLoadState("domcontentloaded").catch(() => undefined);
-    await page.waitForTimeout(500).catch(() => undefined);
+    await page.waitForTimeout(250).catch(() => undefined);
 
     if (await this.isLoggedIn()) {
       this.updateStatus("Auto login completed");
@@ -338,6 +384,108 @@ class TicketAssistBot {
     return "unknown";
   }
 
+  private parseThaiSaleDateTime(text: string): number | null {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    const match = normalized.match(
+      /วันเปิดจำหน่าย(?:บัตร)?\s*:?\s*วัน[^\d]*?(\d{1,2})\s+(มกราคม|กุมภาพันธ์|มีนาคม|เมษายน|พฤษภาคม|มิถุนายน|กรกฎาคม|สิงหาคม|กันยายน|ตุลาคม|พฤศจิกายน|ธันวาคม)\s+(\d{4}).{0,40}?(\d{1,2}):(\d{2})/i,
+    );
+    if (!match) {
+      return null;
+    }
+
+    const monthMap: Record<string, number> = {
+      มกราคม: 0,
+      กุมภาพันธ์: 1,
+      มีนาคม: 2,
+      เมษายน: 3,
+      พฤษภาคม: 4,
+      มิถุนายน: 5,
+      กรกฎาคม: 6,
+      สิงหาคม: 7,
+      กันยายน: 8,
+      ตุลาคม: 9,
+      พฤศจิกายน: 10,
+      ธันวาคม: 11,
+    };
+
+    const day = Number.parseInt(match[1], 10);
+    const month = monthMap[match[2]];
+    const buddhistYear = Number.parseInt(match[3], 10);
+    const hour = Number.parseInt(match[4], 10);
+    const minute = Number.parseInt(match[5], 10);
+
+    if (
+      Number.isNaN(day) ||
+      month === undefined ||
+      Number.isNaN(buddhistYear) ||
+      Number.isNaN(hour) ||
+      Number.isNaN(minute)
+    ) {
+      return null;
+    }
+
+    const year = buddhistYear > 2400 ? buddhistYear - 543 : buddhistYear;
+    return new Date(year, month, day, hour, minute, 0, 0).getTime();
+  }
+
+  private roundValueMatchesSignature(roundValue: string, signatureParts: string[]): boolean {
+    const normalizedRoundValue = roundValue.trim().toLowerCase();
+    if (!normalizedRoundValue) {
+      return false;
+    }
+
+    if (signatureParts.some((part) => part.toLowerCase().includes(normalizedRoundValue))) {
+      return true;
+    }
+
+    const normalizedSignature = signatureParts.join(" ").toLowerCase();
+    const roundDataButton = normalizedRoundValue.match(/data-button["'=:\s]*([a-z0-9_-]+)/i)?.[1];
+    if (roundDataButton && normalizedSignature.includes(roundDataButton.toLowerCase())) {
+      return true;
+    }
+
+    try {
+      const desiredUrl = new URL(roundValue);
+      const desiredQuery = desiredUrl.searchParams.get("query");
+      const desiredRdId = desiredUrl.searchParams.get("rdId");
+
+      for (const part of signatureParts) {
+        const match = part.match(/https?:\/\/[^\s"'<>]+|\/booking\/[^\s"'<>]+/i);
+        const candidateRaw = match?.[0];
+        if (!candidateRaw) {
+          continue;
+        }
+
+        const candidateUrl = candidateRaw.startsWith("http")
+          ? new URL(candidateRaw)
+          : new URL(candidateRaw, desiredUrl.origin);
+
+        if (
+          candidateUrl.pathname.replace(/\/+$/, "") === desiredUrl.pathname.replace(/\/+$/, "") &&
+          candidateUrl.searchParams.get("query") === desiredQuery &&
+          (!desiredRdId || candidateUrl.searchParams.get("rdId") === desiredRdId)
+        ) {
+          return true;
+        }
+
+        const candidateDataButton = candidateUrl.searchParams.get("data-button");
+        if (desiredQuery && candidateDataButton && candidateDataButton === desiredQuery) {
+          return true;
+        }
+      }
+    } catch {
+      return false;
+    }
+
+    return false;
+  }
+
+  private async extractSaleOpenAt(): Promise<number | null> {
+    const page = this.requirePage();
+    const text = await readPageText(page);
+    return this.parseThaiSaleDateTime(text);
+  }
+
   async findMatchingRoundRow() {
     const page = this.requirePage();
     const rows = page.locator(".box-event-list .body .row");
@@ -373,10 +521,15 @@ class TicketAssistBot {
 
       let matches = false;
       if (desiredRoundValue) {
-        matches = signature.includes(desiredRoundValue);
+        matches = this.roundValueMatchesSignature(desiredRoundValue, [
+          signature,
+          rowHtml,
+          label,
+          venueText,
+        ]);
       }
 
-      if (!matches && desiredRound) {
+      if (!matches && desiredRound && !desiredRoundValue) {
         const normalizedLabel = label.toLowerCase();
         matches =
           normalizedLabel.includes(desiredRound) ||
@@ -425,6 +578,7 @@ class TicketAssistBot {
   async waitUntilSaleWindow() {
     const page = this.requirePage();
     const startedAt = Date.now();
+    let waitingForLastThirtySeconds = false;
 
     while (Date.now() - startedAt < concertConfig.waitForSaleMs) {
       const matchedRound = await this.findMatchingRoundRow();
@@ -473,7 +627,27 @@ class TicketAssistBot {
         }
       }
 
-      await page.waitForTimeout(600);
+      if (status === "coming_soon") {
+        const saleOpenAt = await this.extractSaleOpenAt();
+        if (saleOpenAt) {
+          const remainingMs = saleOpenAt - Date.now();
+          if (remainingMs > 30_000) {
+            if (!waitingForLastThirtySeconds) {
+              this.updateStatus(
+                `Coming soon detected. Waiting until the last 30 seconds before sale opens (${Math.ceil(
+                  remainingMs / 1000,
+                )}s remaining)`,
+              );
+              waitingForLastThirtySeconds = true;
+            }
+            await page.waitForTimeout(Math.min(5_000, remainingMs - 30_000));
+            continue;
+          }
+        }
+      }
+
+      waitingForLastThirtySeconds = false;
+      await page.waitForTimeout(status === "coming_soon" ? 2_000 : 350);
       await page.reload({ waitUntil: "domcontentloaded" });
     }
 
@@ -539,16 +713,28 @@ class TicketAssistBot {
       .filter(Boolean);
   }
 
+  getLoginEmail(): string | null {
+    const email = this.runtimeConfig.loginUsername?.trim();
+    if (!email) {
+      return null;
+    }
+
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
+  }
+
   async canAutoFillEnrollPage(): Promise<boolean> {
     const page = this.requirePage();
     const attendeeNames = this.getAttendeeNames();
-    if (!attendeeNames.length) {
-      return false;
-    }
+    const loginEmail = this.getLoginEmail();
 
     const fullNameCount = await page.locator('input[name="txt_fullname[]"]:visible').count();
     if (fullNameCount > 0) {
       return attendeeNames.length >= fullNameCount;
+    }
+
+    const emailCount = await page.locator('input[name="txt_email[]"]:visible').count();
+    if (emailCount > 0) {
+      return Boolean(loginEmail);
     }
 
     const firstNameCount = await page.locator('input[name="txt_firstname[]"]:visible').count();
@@ -712,7 +898,7 @@ class TicketAssistBot {
       const currentMode = await this.classifyCurrentPage();
       if (!this.isManualPageMode(currentMode)) {
         if (mode === "manual_login") {
-          this.updateStatus("Manual login completed, returning to event page");
+          this.updateStatus("Manual login completed, returning to event flow");
           await this.navigateToEvent();
           const eventMode = await this.classifyCurrentPage();
           this.updateStatus(`Returned to event page, current page: ${eventMode}`);
@@ -724,7 +910,7 @@ class TicketAssistBot {
         return currentMode;
       }
 
-      await page.waitForTimeout(1_000);
+      await page.waitForTimeout(500);
     }
 
     throw new Error(`Timed out waiting for manual step: ${mode}`);
@@ -741,19 +927,19 @@ class TicketAssistBot {
 
     while (Date.now() - startedAt < concertConfig.waitForSaleMs) {
       if (await this.isLoggedIn()) {
-        this.updateStatus("Manual login completed, returning to event page");
+        this.updateStatus("Manual login completed, returning to event flow");
         await this.navigateToEvent();
         return true;
       }
 
       const currentUrl = page.url();
       if (!/signin\.php/i.test(currentUrl) && (await this.isLoggedIn())) {
-        this.updateStatus("Login redirect detected, returning to event page");
+        this.updateStatus("Login redirect detected, returning to event flow");
         await this.navigateToEvent();
         return true;
       }
 
-      await page.waitForTimeout(1_000);
+      await page.waitForTimeout(500);
     }
 
     throw new Error("Timed out waiting for manual login");
@@ -775,7 +961,7 @@ class TicketAssistBot {
         return true;
       }
 
-      await page.waitForTimeout(1_000);
+      await page.waitForTimeout(500);
     }
 
     throw new Error("Timed out waiting for manual verification");
@@ -799,7 +985,7 @@ class TicketAssistBot {
         return true;
       }
 
-      await page.waitForTimeout(1_000);
+      await page.waitForTimeout(500);
     }
 
     throw new Error("Timed out waiting for anti-bot verification");
@@ -833,7 +1019,7 @@ class TicketAssistBot {
         return "queue";
       }
 
-      await page.waitForTimeout(150);
+      await page.waitForTimeout(120);
     }
 
     return "unknown";
@@ -855,6 +1041,7 @@ class TicketAssistBot {
   async handleQueueIfPresent() {
     const page = this.requirePage();
     const startedAt = Date.now();
+    let hasReloaded = false;
 
     while (Date.now() - startedAt < concertConfig.waitForSaleMs) {
       if ((await this.classifyCurrentPage()) !== "auto_queue") {
@@ -862,8 +1049,12 @@ class TicketAssistBot {
       }
 
       this.updateStatus("Still in queue, waiting for the next page");
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(hasReloaded ? 300 : 900);
+      if ((await this.classifyCurrentPage()) !== "auto_queue") {
+        return;
+      }
       await page.reload({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+      hasReloaded = true;
     }
 
     throw new Error("Queue wait timed out");
@@ -1051,7 +1242,7 @@ class TicketAssistBot {
   async returnToZoneSelection() {
     const page = this.requirePage();
     const backToZone = page
-      .locator('a[href*="/booking/3m/zones.php?query=445"]')
+      .locator('a[href*="/booking/3m/zones.php?query="]')
       .or(page.getByRole("link", { name: /เลือกโซนอื่น|ย้อนกลับ/i }));
 
     if (await backToZone.count()) {
@@ -1060,11 +1251,21 @@ class TicketAssistBot {
       return;
     }
 
-    await page
-      .goto("/booking/3m/zones.php?query=445", {
-        waitUntil: "domcontentloaded",
-      })
-      .catch(() => undefined);
+    const currentUrl = page.url();
+    const url = new URL(currentUrl);
+    const query = url.searchParams.get("query");
+    const rdId = url.searchParams.get("rdId");
+    if (!query) {
+      return;
+    }
+
+    const fallbackUrl = new URL("https://booking.thaiticketmajor.com/booking/3m/zones.php");
+    fallbackUrl.searchParams.set("query", query);
+    if (rdId) {
+      fallbackUrl.searchParams.set("rdId", rdId);
+    }
+
+    await page.goto(fallbackUrl.toString(), { waitUntil: "domcontentloaded" }).catch(() => undefined);
   }
 
   async confirmSelectedSeat(): Promise<boolean> {
@@ -1159,14 +1360,53 @@ class TicketAssistBot {
 
     const allowAnyZone =
       this.runtimeConfig.allowFallbackAny || this.runtimeConfig.zonePreference.length === 0;
+    const effectiveZoneTypePreference = this.getEffectiveZoneTypePreference();
 
     let zonePicked: string | null = null;
     if (this.runtimeConfig.zonePreference.length > 0) {
-      zonePicked = await choosePreferredZone(this.requirePage(), this.runtimeConfig.zonePreference);
+      zonePicked = await choosePreferredZone(
+        this.requirePage(),
+        this.runtimeConfig.zonePreference,
+        effectiveZoneTypePreference,
+        [...this.exhaustedZoneNames],
+      );
     }
 
     if (!zonePicked && allowAnyZone) {
-      zonePicked = await chooseAnyZone(this.requirePage());
+      zonePicked = await chooseAnyZone(
+        this.requirePage(),
+        effectiveZoneTypePreference,
+        [...this.exhaustedZoneNames],
+      );
+    }
+
+    if (
+      !zonePicked &&
+      this.runtimeConfig.zoneTypePreference === "both" &&
+      !this.standingFallbackEnabled
+    ) {
+      this.standingFallbackEnabled = true;
+      this.exhaustedZoneNames.clear();
+      this.updateStatus(
+        "No seating zone is available now. Switching fallback to standing zones.",
+      );
+
+      if (this.runtimeConfig.zonePreference.length > 0) {
+        zonePicked = await choosePreferredZone(
+          this.requirePage(),
+          this.runtimeConfig.zonePreference,
+          "standing-only",
+          [...this.exhaustedZoneNames],
+        );
+      }
+
+      if (!zonePicked && allowAnyZone) {
+        zonePicked = await chooseAnyZone(
+          this.requirePage(),
+          "standing-only",
+          [...this.exhaustedZoneNames],
+        );
+      }
     }
 
     if (!zonePicked) {
@@ -1183,9 +1423,11 @@ class TicketAssistBot {
 
     const allowAnyZone =
       this.runtimeConfig.allowFallbackAny || this.runtimeConfig.zonePreference.length === 0;
+    const effectiveZoneTypePreference = this.getEffectiveZoneTypePreference();
 
     const seatSelected = await retrySeatSelection(this.requirePage(), {
       zonePreference: this.runtimeConfig.zonePreference,
+      zoneTypePreference: effectiveZoneTypePreference,
       currentZoneHint: this.lastSelectedZone ?? undefined,
       seatRowPreference: concertConfig.seatRowPreference,
       preferredSeats: this.runtimeConfig.preferredSeats,
@@ -1200,6 +1442,16 @@ class TicketAssistBot {
     });
 
     if (!seatSelected) {
+      if (allowAnyZone) {
+        if (this.lastSelectedZone) {
+          this.exhaustedZoneNames.add(this.lastSelectedZone.toUpperCase());
+        }
+        this.updateStatus(
+          "No seat found in current seating zone. Returning to zone selection to try another zone type.",
+        );
+        await this.returnToZoneSelection();
+        return;
+      }
       throw new Error("No seat found within retry limit");
     }
 
@@ -1237,7 +1489,7 @@ class TicketAssistBot {
     const methodButton = page.locator(`.verify-method-btn[data-method="${method}"]`);
     if (await methodButton.count()) {
       await methodButton.first().click().catch(() => undefined);
-      await page.waitForTimeout(250).catch(() => undefined);
+      await page.waitForTimeout(320).catch(() => undefined);
     }
 
     await page
@@ -1291,7 +1543,8 @@ class TicketAssistBot {
   async handleAutoEnrollPage() {
     const page = this.requirePage();
     const attendeeNames = this.getAttendeeNames();
-    if (!attendeeNames.length) {
+    const loginEmail = this.getLoginEmail();
+    if (!attendeeNames.length && !loginEmail) {
       return false;
     }
 
@@ -1336,7 +1589,26 @@ class TicketAssistBot {
       await lastNameInputs.nth(index).fill(lastName).catch(() => undefined);
     }
 
-    this.updateStatus(`Filled attendee details for ${attendeeNames.length} ticket holder(s)`);
+    const emailInputs = page.locator(
+      'input[name="txt_email[]"]:visible, input[id^="txt_email_"]:visible',
+    );
+    const emailCount = await emailInputs.count();
+    if (loginEmail) {
+      for (let index = 0; index < emailCount; index += 1) {
+        await emailInputs.nth(index).fill(loginEmail).catch(() => undefined);
+      }
+    }
+
+    const filledParts = [];
+    if (attendeeNames.length) {
+      filledParts.push(`${attendeeNames.length} ticket holder(s)`);
+    }
+    if (loginEmail && emailCount > 0) {
+      filledParts.push(`email ${loginEmail}`);
+    }
+    this.updateStatus(
+      `Filled attendee details for ${filledParts.join(", ") || "available fields"}`,
+    );
 
     const enrollSubmitButton = page.locator("#btn_regnow").first();
     await enrollSubmitButton.scrollIntoViewIfNeeded().catch(() => undefined);
@@ -1370,13 +1642,14 @@ class TicketAssistBot {
     await this.navigateToEvent();
 
     const status = await this.waitUntilSaleWindow();
+    let flowAttemptLimit = concertConfig.maxFlowRetries;
 
     for (
       let flowAttempt = 1;
-      flowAttempt <= concertConfig.maxFlowRetries;
+      flowAttempt <= flowAttemptLimit;
       flowAttempt += 1
     ) {
-      this.updateStatus(`Seat flow attempt ${flowAttempt}/${concertConfig.maxFlowRetries}`);
+      this.updateStatus(`Seat flow attempt ${flowAttempt}/${flowAttemptLimit}`);
 
       if (await this.recoverFromRoundResetErrorIfNeeded()) {
         continue;
@@ -1416,6 +1689,14 @@ class TicketAssistBot {
 
       if (this.isManualPageMode(currentMode)) {
         currentMode = await this.waitForManualPageResolution(currentMode);
+      }
+
+      if (currentMode === "auto_zone") {
+        const estimatedZoneAttempts = await this.estimateZoneAttemptLimit();
+        if (estimatedZoneAttempts && estimatedZoneAttempts > flowAttemptLimit) {
+          flowAttemptLimit = estimatedZoneAttempts;
+          this.updateStatus(`Expanded seat flow attempts to ${flowAttemptLimit} based on available zones`);
+        }
       }
 
       if (currentMode === "auto_round") {
@@ -1484,7 +1765,7 @@ class TicketAssistBot {
       }
 
       if (finalMode === "auto_zone") {
-        this.updateStatus("Returned to zone page after seat confirmation, retrying flow");
+        this.updateStatus("Returned to zone page, retrying flow");
         await this.requirePage()
           .waitForTimeout(concertConfig.retryIntervalMs)
           .catch(() => undefined);
@@ -2088,6 +2369,14 @@ const uiHtml = `<!doctype html>
                 <input id="zonePreference" type="text" placeholder="เช่น A2, A3, B2" />
               </label>
               <label>
+                ประเภทโซน
+                <select id="zoneTypePreference">
+                  <option value="both">ได้ทั้ง Standing และ Seating</option>
+                  <option value="standing-only">Standing only</option>
+                  <option value="seating-only">Seating only</option>
+                </select>
+              </label>
+              <label>
                 Preferred seats
                 <input id="preferredSeats" type="text" placeholder="เช่น G-49, G-50" />
               </label>
@@ -2182,6 +2471,7 @@ const uiHtml = `<!doctype html>
     const loginPassword = document.getElementById("loginPassword");
     const ticketQuantity = document.getElementById("ticketQuantity");
     const zonePreference = document.getElementById("zonePreference");
+    const zoneTypePreference = document.getElementById("zoneTypePreference");
     const preferredSeats = document.getElementById("preferredSeats");
     const seatSelectionStrategy = document.getElementById("seatSelectionStrategy");
     const verifyMethod = document.getElementById("verifyMethod");
@@ -2252,6 +2542,11 @@ const uiHtml = `<!doctype html>
         ["การ login", loginUsername.value.trim() ? "Auto login ด้วย " + loginUsername.value.trim() : "ให้ลูกค้า login เอง"],
         ["จำนวนบัตร", ticketQuantity.value || "1"],
         ["Preferred zones", zonePreference.value.trim() || "ให้ระบบเลือกตามที่หาได้"],
+        ["ประเภทโซน", ({
+            "both": "ได้ทั้ง Standing และ Seating",
+            "standing-only": "Standing only",
+            "seating-only": "Seating only"
+          }[zoneTypePreference.value] || "ได้ทั้ง Standing และ Seating")],
         ["Preferred seats", preferredSeats.value.trim() || "ไม่ได้ล็อกที่นั่งเฉพาะ"],
         ["ลำดับเลือกที่นั่ง", preferredSeats.value.trim()
           ? "ข้าม เพราะระบุเลขที่นั่งไว้แล้ว"
@@ -2451,6 +2746,7 @@ const uiHtml = `<!doctype html>
           loginPassword: loginPassword.value,
           ticketQuantity: ticketQuantity.value,
           zonePreference: zonePreference.value,
+          zoneTypePreference: zoneTypePreference.value,
           preferredSeats: preferredSeats.value,
           seatSelectionStrategy: seatSelectionStrategy.value,
           verifyMethod: verifyMethod.value,
@@ -2477,6 +2773,7 @@ const uiHtml = `<!doctype html>
     loginUsername.addEventListener("input", renderPreview);
     loginPassword.addEventListener("input", renderPreview);
     zonePreference.addEventListener("input", renderPreview);
+    zoneTypePreference.addEventListener("change", renderPreview);
     seatSelectionStrategy.addEventListener("change", renderPreview);
     verifyMethod.addEventListener("change", renderPreview);
     thaiId.addEventListener("input", renderPreview);
@@ -2574,6 +2871,15 @@ function normalizeRunConfig(body: Record<string, unknown>): BotRunConfig {
           .map((item) => item.trim())
           .filter(Boolean)
       : [];
+  const rawZoneTypePreference =
+    typeof body.zoneTypePreference === "string"
+      ? body.zoneTypePreference.trim().toLowerCase()
+      : "";
+  const zoneTypePreference: ZoneTypePreference =
+    rawZoneTypePreference === "standing-only" ||
+    rawZoneTypePreference === "seating-only"
+      ? rawZoneTypePreference
+      : "both";
   const preferredSeats =
     typeof body.preferredSeats === "string" && body.preferredSeats.trim()
       ? body.preferredSeats
@@ -2631,6 +2937,7 @@ function normalizeRunConfig(body: Record<string, unknown>): BotRunConfig {
     loginUsername,
     loginPassword,
     zonePreference,
+    zoneTypePreference,
     preferredSeats,
     seatSelectionStrategy,
     ticketQuantity,

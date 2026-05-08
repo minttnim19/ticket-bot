@@ -2,6 +2,7 @@ import { Locator, Page } from "playwright";
 
 export type SeatRetryOptions = {
   zonePreference: string[];
+  zoneTypePreference?: ZoneTypePreference;
   currentZoneHint?: string;
   seatRowPreference?: string[];
   preferredSeats?: string[];
@@ -23,6 +24,8 @@ export type SeatSelectionStrategy =
   | "front-right"
   | "back-left"
   | "back-right";
+
+export type ZoneTypePreference = "both" | "standing-only" | "seating-only";
 
 type SeatCandidate = {
   row: string;
@@ -108,7 +111,7 @@ async function waitForZoneTransition(page: Page): Promise<void> {
       state: "attached",
       timeout: 5_000,
     }),
-    page.waitForTimeout(350),
+    page.waitForTimeout(280),
   ]).catch(() => undefined);
 }
 
@@ -136,6 +139,30 @@ async function clickZoneLocator(zoneOption: Locator): Promise<boolean> {
   return true;
 }
 
+async function matchesZoneTypePreference(
+  zoneOption: Locator,
+  zoneTypePreference: ZoneTypePreference,
+): Promise<boolean> {
+  if (zoneTypePreference === "both") {
+    return true;
+  }
+
+  const href = (await zoneOption.getAttribute("href").catch(() => ""))?.toLowerCase() ?? "";
+  if (!href) {
+    return true;
+  }
+
+  if (zoneTypePreference === "standing-only") {
+    return href.includes("#festival.php#");
+  }
+
+  if (zoneTypePreference === "seating-only") {
+    return href.includes("#fixed.php#");
+  }
+
+  return true;
+}
+
 async function inferZoneName(zoneOption: Locator): Promise<string | null> {
   const href = await zoneOption.getAttribute("href").catch(() => null);
   if (href) {
@@ -157,6 +184,7 @@ async function inferZoneName(zoneOption: Locator): Promise<string | null> {
 export async function choosePreferredZone(
   page: Page,
   zonePreference: string[],
+  zoneTypePreference: ZoneTypePreference = "both",
   excludedZones: string[] = [],
 ): Promise<string | null> {
   for (const zoneName of zonePreference) {
@@ -168,7 +196,11 @@ export async function choosePreferredZone(
       `map area[href$="#${zoneName}"], map area[href*="#${zoneName}"]`,
     );
     if (await imageMapZone.count()) {
-      const clicked = await clickZoneLocator(imageMapZone.first());
+      const zoneLocator = imageMapZone.first();
+      if (!(await matchesZoneTypePreference(zoneLocator, zoneTypePreference))) {
+        continue;
+      }
+      const clicked = await clickZoneLocator(zoneLocator);
       if (clicked) {
         await waitForZoneTransition(page);
         return zoneName.toUpperCase();
@@ -188,6 +220,10 @@ export async function choosePreferredZone(
       continue;
     }
 
+    if (!(await matchesZoneTypePreference(zoneOption, zoneTypePreference))) {
+      continue;
+    }
+
     if (await clickZoneLocator(zoneOption)) {
       await waitForZoneTransition(page);
       return zoneName.toUpperCase();
@@ -199,6 +235,7 @@ export async function choosePreferredZone(
 
 export async function chooseAnyZone(
   page: Page,
+  zoneTypePreference: ZoneTypePreference = "both",
   excludedZones: string[] = [],
 ): Promise<string | null> {
   const candidates = [
@@ -217,6 +254,10 @@ export async function chooseAnyZone(
         continue;
       }
       if (zoneName && excludedZones.includes(zoneName)) {
+        continue;
+      }
+
+      if (!(await matchesZoneTypePreference(zoneOption, zoneTypePreference))) {
         continue;
       }
 
@@ -242,6 +283,44 @@ export async function chooseAnyZone(
   }
 
   return null;
+}
+
+export async function countSelectableZones(
+  page: Page,
+  zoneTypePreference: ZoneTypePreference = "both",
+  preferredZones: string[] = [],
+): Promise<number> {
+  const candidates = [
+    page.locator('map area[href*="#fixed.php#"], map area[href*="#festival.php#"]'),
+    page.locator("[data-zone]"),
+    page.locator("button[data-zone]"),
+    page.locator("a[data-zone]"),
+  ];
+  const preferredZoneSet = new Set(preferredZones.map((zone) => zone.trim().toUpperCase()).filter(Boolean));
+  const matched = new Set<string>();
+
+  for (const candidateGroup of candidates) {
+    const count = await candidateGroup.count();
+    for (let index = 0; index < count; index += 1) {
+      const zoneOption = candidateGroup.nth(index);
+      const zoneName = await inferZoneName(zoneOption);
+      if (!zoneName) {
+        continue;
+      }
+
+      if (preferredZoneSet.size > 0 && !preferredZoneSet.has(zoneName)) {
+        continue;
+      }
+
+      if (!(await matchesZoneTypePreference(zoneOption, zoneTypePreference))) {
+        continue;
+      }
+
+      matched.add(zoneName);
+    }
+  }
+
+  return matched.size;
 }
 
 function parseSeatTitle(title: string): { row: string; number: number } | null {
@@ -303,7 +382,7 @@ async function collectSeatCandidates(page: Page): Promise<SeatCandidate[]> {
 async function clickSeatSet(page: Page, seats: SeatCandidate[]): Promise<boolean> {
   for (const seat of seats) {
     await page.locator(seat.locatorSelector).click({ timeout: 3_000 }).catch(() => undefined);
-    await page.waitForTimeout(50);
+    await page.waitForTimeout(80);
   }
   return seats.length > 0;
 }
@@ -697,17 +776,18 @@ export async function retrySeatSelection(
       pickedZoneName = await choosePreferredZone(
         page,
         options.zonePreference,
+        options.zoneTypePreference,
         [...exhaustedZones],
       );
     }
 
     if (!pickedZoneName && options.allowFallbackAnyZone) {
-      pickedZoneName = await chooseAnyZone(page, [...exhaustedZones]);
+      pickedZoneName = await chooseAnyZone(page, options.zoneTypePreference, [...exhaustedZones]);
     }
 
     if (pickedZoneName) {
       activeZoneHint = pickedZoneName;
-      await page.waitForTimeout(80);
+      await page.waitForTimeout(70);
       await page.waitForLoadState("domcontentloaded").catch(() => undefined);
     }
 

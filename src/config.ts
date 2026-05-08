@@ -21,7 +21,7 @@ export const concertConfig: ConcertConfig = {
   seatRowPreference: ["G", "F", "E", "J", "I", "K", "L", "M", "D", "H"],
   roundValue: "81544",
   maxFlowRetries: 5,
-  retryIntervalMs: 350,
+  retryIntervalMs: 300,
   maxRetries: 30,
   waitForSaleMs: 60_000,
   stopBeforePayment: true,
