@@ -60,6 +60,7 @@ type RoundHintsResponse = {
   rounds: RoundOption[];
   saleOpen: boolean;
   notice?: string;
+  saleOpenAt?: number | null;
 };
 
 const trailingSlashPattern = /\/+$/;
@@ -110,6 +111,33 @@ function buildStartMessage(eventUrl: string, roundText?: string): string {
 
 function buildStartedMessage(roundText?: string): string {
   return roundText ? `เริ่มทำงานแล้ว ที่รอบ ${roundText}` : "เริ่มทำงานแล้ว";
+}
+
+function parseSaleOpenTimestamp(text: string): number | null {
+  const normalized = text.replaceAll(/\s+/g, " ").trim();
+  const match = execPattern(saleDateTimePattern, normalized);
+  if (!match) {
+    return null;
+  }
+
+  const day = Number.parseInt(match[1], 10);
+  const month = thaiMonthIndex[match[2]];
+  const buddhistYear = Number.parseInt(match[3], 10);
+  const hour = Number.parseInt(match[4], 10);
+  const minute = Number.parseInt(match[5], 10);
+
+  if (
+    Number.isNaN(day) ||
+    month === undefined ||
+    Number.isNaN(buddhistYear) ||
+    Number.isNaN(hour) ||
+    Number.isNaN(minute)
+  ) {
+    return null;
+  }
+
+  const year = buddhistYear > 2400 ? buddhistYear - 543 : buddhistYear;
+  return new Date(year, month, day, hour, minute, 0, 0).getTime();
 }
 
 function formatZoneSelectionStrategyLabel(strategy: SeatSelectionStrategy): string {
@@ -256,6 +284,7 @@ class TicketAssistBot {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private lastSelectedZone: string | null = null;
+  private lastReportedStatus = "";
   private readonly exhaustedZoneNames = new Set<string>();
   private standingFallbackEnabled = false;
   private keepBrowserOpen = false;
@@ -266,12 +295,18 @@ class TicketAssistBot {
   ) {}
 
   private updateStatus(message: string) {
-    console.log(message);
+    if (message === this.lastReportedStatus) {
+      return;
+    }
+    this.lastReportedStatus = message;
+    if (!this.reportStatus || this.isDebugEnabled()) {
+      console.log(message);
+    }
     this.reportStatus?.(message);
   }
 
   private isDebugEnabled(): boolean {
-    return /^(1|true|yes|on)$/i.test(process.env.DEBUG ?? "");
+    return concertConfig.debug;
   }
 
   private debugStatus(message: string) {
@@ -551,30 +586,7 @@ class TicketAssistBot {
   }
 
   private parseThaiSaleDateTime(text: string): number | null {
-    const normalized = text.replaceAll(/\s+/g, " ").trim();
-    const match = execPattern(saleDateTimePattern, normalized);
-    if (!match) {
-      return null;
-    }
-
-    const day = Number.parseInt(match[1], 10);
-    const month = thaiMonthIndex[match[2]];
-    const buddhistYear = Number.parseInt(match[3], 10);
-    const hour = Number.parseInt(match[4], 10);
-    const minute = Number.parseInt(match[5], 10);
-
-    if (
-      Number.isNaN(day) ||
-      month === undefined ||
-      Number.isNaN(buddhistYear) ||
-      Number.isNaN(hour) ||
-      Number.isNaN(minute)
-    ) {
-      return null;
-    }
-
-    const year = buddhistYear > 2400 ? buddhistYear - 543 : buddhistYear;
-    return new Date(year, month, day, hour, minute, 0, 0).getTime();
+    return parseSaleOpenTimestamp(text);
   }
 
   private reportZoneOrder(strategy: SeatSelectionStrategy, zoneNames: string[]) {
@@ -761,7 +773,7 @@ class TicketAssistBot {
       }
 
       const status = await this.detectTicketStatus();
-      console.log(`Current event status: ${status}`);
+      this.debugStatus(`Current event status: ${status}`);
 
       if (!matchedRound && (status === "on_sale" || status === "queue")) {
         return status;
@@ -2334,6 +2346,19 @@ const uiHtml = `<!doctype html>
       letter-spacing: 0.04em;
       text-transform: uppercase;
     }
+    .sale-open-note {
+      margin-top: 10px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-radius: 14px;
+      background: #fff6df;
+      border: 1px solid #ecd8a6;
+      color: #7c5d16;
+      font-size: 13px;
+      font-weight: 700;
+    }
     .round-list {
       border-radius: 22px;
       overflow: hidden;
@@ -2478,6 +2503,7 @@ const uiHtml = `<!doctype html>
               <button id="startJob" class="primary" type="button" disabled>เริ่มทำงาน</button>
             </div>
             <div id="rounds" class="rounds"></div>
+            <div id="saleOpenInfo" class="sale-open-note" style="display:none;"></div>
             <p class="hint">ถ้าโหลดรอบไม่สำเร็จ ยังสามารถพิมพ์ข้อความรอบเองแล้วเริ่มงานได้เมื่อรอบนั้นเปิดขาย</p>
           </div>
         </section>
@@ -2632,6 +2658,7 @@ const uiHtml = `<!doctype html>
     const eventUrl = document.getElementById("eventUrl");
     const roundText = document.getElementById("roundText");
     const rounds = document.getElementById("rounds");
+    const saleOpenInfo = document.getElementById("saleOpenInfo");
     const statusBadge = document.getElementById("statusBadge");
     const statusText = document.getElementById("statusText");
     const startJobButton = document.getElementById("startJob");
@@ -2653,8 +2680,25 @@ const uiHtml = `<!doctype html>
     const sampleUrl = "https://www.thaiticketmajor.com/performance/when-oranges-fall-first-fall-first-love.html";
     eventUrl.value = sampleUrl;
     let saleOpen = false;
+    let saleOpenAt = null;
     let selectedRoundValue = "";
     let roundOptionsCache = [];
+
+    function renderSaleOpenInfo() {
+      if (!saleOpenAt) {
+        saleOpenInfo.style.display = "none";
+        saleOpenInfo.textContent = "";
+        return;
+      }
+
+      saleOpenInfo.style.display = "inline-flex";
+      saleOpenInfo.textContent =
+        "เวลาเปิดขาย: " +
+        new Intl.DateTimeFormat("th-TH", {
+          dateStyle: "medium",
+          timeStyle: "short"
+        }).format(new Date(saleOpenAt));
+    }
 
     function getTicketHolderInputs() {
       return Array.from(document.querySelectorAll(".ticket-holder-name"));
@@ -2873,6 +2917,8 @@ const uiHtml = `<!doctype html>
     async function loadRoundHints() {
       rounds.innerHTML = "";
       saleOpen = false;
+      saleOpenAt = null;
+      renderSaleOpenInfo();
       updateStartButton();
       statusText.textContent = "กำลังโหลดเวลารอบจากหน้า event...";
       const response = await fetch("/api/rounds", {
@@ -2890,6 +2936,8 @@ const uiHtml = `<!doctype html>
         return;
       }
       saleOpen = Boolean(result.saleOpen);
+      saleOpenAt = typeof result.saleOpenAt === "number" ? result.saleOpenAt : null;
+      renderSaleOpenInfo();
       statusText.textContent = result.notice || (saleOpen
         ? "กดเลือกเวลาที่ต้องการได้เลย"
         : "พบรอบการแสดง แต่ยังไม่เปิดให้กดบัตร");
@@ -3292,13 +3340,14 @@ async function fetchRoundHints(eventUrl: string): Promise<RoundHintsResponse> {
   const html = await response.text();
   const rounds = extractRoundHints(html);
   const saleOpen = rounds.some((round) => round.isOpen);
+  const saleOpenAt = parseSaleOpenTimestamp(decodeHtml(html));
   let notice = "ไม่พบเวลารอบจากหน้า event ให้กรอกเองได้";
   if (rounds.length) {
     notice = saleOpen
       ? "กดเลือกเวลาที่ต้องการได้เลย"
       : "มีช่วงเวลาแสดงตามรายการด้านล่าง แต่ยังไม่เปิดให้กดบัตร";
   }
-  return { rounds, saleOpen, notice };
+  return { rounds, saleOpen, saleOpenAt, notice };
 }
 
 function startBotRun(config: BotRunConfig) {

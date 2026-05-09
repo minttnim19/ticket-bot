@@ -1,4 +1,5 @@
 import { Locator, Page } from "playwright";
+import { concertConfig } from "./config";
 
 export type SeatRetryOptions = {
   zonePreference: string[];
@@ -49,6 +50,10 @@ type ZoneCandidateMeta = {
   domIndex: number;
 };
 
+type SeatSelectionResult =
+  | { selected: true; attemptedLabels: string[] }
+  | { selected: false; seatUnavailablePopup: boolean; attemptedLabels: string[] };
+
 const unavailablePatterns = [
   { label: "coming soon", pattern: /coming\s*soon/i },
   { label: "temporarily unavailable", pattern: /temporarily\s*unavailable/i },
@@ -58,6 +63,17 @@ const unavailablePatterns = [
 ] as const;
 const zoneSuffixPattern = /#([A-Z0-9]+)$/i;
 const seatTitlePattern = /^([A-Z]+)-(\d+)$/i;
+
+function isDebugEnabled(): boolean {
+  return concertConfig.debug;
+}
+
+function debugLog(message: string) {
+  if (!isDebugEnabled()) {
+    return;
+  }
+  console.log(message);
+}
 
 async function firstVisibleLocator(
   candidates: Locator[],
@@ -569,12 +585,55 @@ async function collectSeatCandidates(page: Page): Promise<SeatCandidate[]> {
   return seats;
 }
 
-async function clickSeatSet(page: Page, seats: SeatCandidate[]): Promise<boolean> {
+async function handleSeatUnavailablePopup(page: Page): Promise<boolean> {
+  const popup = page.locator("#popup_alert").first();
+  if (!(await popup.count())) {
+    return false;
+  }
+
+  const message = (
+    (await popup.locator("#alertmessage, [name='alertmessage']").first().textContent().catch(() => "")) ??
+    ""
+  )
+    .trim()
+    .toLowerCase();
+  const looksUnavailable =
+    message.includes("selected seat is not available") ||
+    message.includes("please select new seat") ||
+    message.includes("ที่นั่งถูกเลือกแล้ว") ||
+    message.includes("กรุณาเลือกที่นั่งใหม่");
+
+  if (!looksUnavailable && !(await popup.isVisible().catch(() => false))) {
+    return false;
+  }
+
+  const closeButton = popup
+    .locator("button:has-text('Close'), .btn-red, .fancybox-close, [onclick*='MessageClose']")
+    .first();
+  await closeButton.click({ timeout: 1_500 }).catch(() => undefined);
+  await page
+    .evaluate(() => {
+      const win = globalThis as { MessageClose?: () => void };
+      win.MessageClose?.();
+    })
+    .catch(() => undefined);
+  await popup.waitFor({ state: "hidden", timeout: 2_000 }).catch(() => undefined);
+  await page.waitForTimeout(120);
+  return true;
+}
+
+async function clickSeatSet(page: Page, seats: SeatCandidate[]): Promise<SeatSelectionResult> {
+  const attemptedLabels = seats.map((seat) => seat.label);
   for (const seat of seats) {
     await page.locator(seat.locatorSelector).click({ timeout: 3_000 }).catch(() => undefined);
     await page.waitForTimeout(80);
+    if (await handleSeatUnavailablePopup(page)) {
+      return { selected: false, seatUnavailablePopup: true, attemptedLabels };
+    }
   }
-  return seats.length > 0;
+  return seats.length > 0
+    ? { selected: true, attemptedLabels }
+    : { selected: false, seatUnavailablePopup: false, attemptedLabels };
 }
 
 function pickExactSeats(
@@ -909,11 +968,16 @@ export async function selectSeatSet(
     | "seatRowPreference"
     | "seatSelectionStrategy"
     | "allowFallbackAnySeat"
-  >,
-): Promise<boolean> {
-  const seats = await collectSeatCandidates(page);
+  > & { excludedSeatLabels?: string[] },
+): Promise<SeatSelectionResult> {
+  const excludedSeatSet = new Set(
+    (options.excludedSeatLabels ?? []).map((label) => label.trim().toUpperCase()).filter(Boolean),
+  );
+  const seats = (await collectSeatCandidates(page)).filter(
+    (seat) => !excludedSeatSet.has(seat.label.toUpperCase()),
+  );
   if (!seats.length) {
-    return false;
+    return { selected: false, seatUnavailablePopup: false, attemptedLabels: [] };
   }
 
   const desiredCount = Math.max(1, options.desiredSeatCount);
@@ -935,7 +999,7 @@ export async function selectSeatSet(
     if (adjacent) {
       return clickSeatSet(page, adjacent);
     }
-    return false;
+    return { selected: false, seatUnavailablePopup: false, attemptedLabels: [] };
   }
 
   const preferredSet = pickSeatsByPreference(
@@ -952,7 +1016,7 @@ export async function selectSeatSet(
     return clickSeatSet(page, seats.slice(0, desiredCount));
   }
 
-  return false;
+  return { selected: false, seatUnavailablePopup: false, attemptedLabels: [] };
 }
 
 export async function retrySeatSelection(
@@ -965,6 +1029,7 @@ export async function retrySeatSelection(
       : options.maxRetries;
 
   const exhaustedZones = new Set<string>();
+  const blockedSeatsByZone = new Map<string, Set<string>>();
   let activeZoneHint = options.currentZoneHint?.trim().toUpperCase() || null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -995,17 +1060,36 @@ export async function retrySeatSelection(
       await page.waitForLoadState("domcontentloaded").catch(() => undefined);
     }
 
-    const selected = await selectSeatSet(page, {
+    const activeZoneKey = (pickedZoneName ?? activeZoneHint ?? "").trim().toUpperCase();
+    const blockedSeatLabels = activeZoneKey
+      ? [...(blockedSeatsByZone.get(activeZoneKey) ?? new Set<string>())]
+      : [];
+
+    const seatSelection = await selectSeatSet(page, {
       preferredSeats: options.preferredSeats,
       desiredSeatCount: options.desiredSeatCount,
       requireAdjacent: options.requireAdjacent,
       seatRowPreference: options.seatRowPreference,
       seatSelectionStrategy: options.seatSelectionStrategy,
       allowFallbackAnySeat: options.allowFallbackAnySeat,
+      excludedSeatLabels: blockedSeatLabels,
     });
 
-    if (selected) {
+    if (seatSelection.selected) {
       return true;
+    }
+
+    if (seatSelection.seatUnavailablePopup) {
+      if (activeZoneKey && seatSelection.attemptedLabels.length > 0) {
+        const blocked = blockedSeatsByZone.get(activeZoneKey) ?? new Set<string>();
+        for (const label of seatSelection.attemptedLabels) {
+          blocked.add(label.toUpperCase());
+        }
+        blockedSeatsByZone.set(activeZoneKey, blocked);
+      }
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+      await page.waitForTimeout(options.retryIntervalMs);
+      continue;
     }
 
     if (pickedZoneName) {
@@ -1032,7 +1116,7 @@ export async function retrySeatSelection(
       await page.reload({ waitUntil: "domcontentloaded" }).catch(() => undefined);
     }
 
-    console.log(
+    debugLog(
       `Seat retry ${attempt}/${maxAttempts}: no seat set yet, exhausted zones=${[
         ...exhaustedZones,
       ].join(",") || "-"}, waiting ${options.retryIntervalMs}ms`,

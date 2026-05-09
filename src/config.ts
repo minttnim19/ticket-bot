@@ -10,6 +10,7 @@ export type ConcertConfig = {
   waitForSaleMs: number;
   stopBeforePayment: boolean;
   headless: boolean;
+  debug: boolean;
   storageStatePath: string;
 };
 
@@ -23,8 +24,9 @@ export const concertConfig: ConcertConfig = {
   maxFlowRetries: 5,
   retryIntervalMs: 300,
   maxRetries: 30,
-  waitForSaleMs: 60_000,
+  waitForSaleMs: 300_000,
   stopBeforePayment: true,
   headless: false,
+  debug: false,
   storageStatePath: ".auth/ttm-session.json",
 };
