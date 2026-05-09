@@ -1985,122 +1985,123 @@ const uiHtml = `<!doctype html>
   <title>Ticket Bot Control</title>
   <style>
     :root {
-      --bg: #f5efe7;
-      --panel: #fffdf9;
-      --panel-soft: #f8f2eb;
-      --line: #e7ddd1;
-      --text: #201b17;
-      --muted: #75685d;
-      --accent: #c92312;
-      --accent-dark: #961707;
-      --success: #1d7a43;
-      --warning: #9b6400;
+      --bg: #f3efe8;
+      --panel: #ffffff;
+      --panel-soft: #faf7f2;
+      --line: #e4dbcf;
+      --text: #1f1a16;
+      --muted: #6f6257;
+      --accent: #b91c1c;
+      --accent-dark: #991b1b;
+      --success: #1f7a45;
+      --warning: #8b5a00;
       --danger: #b42318;
-      --shadow: 0 18px 45px rgba(71, 45, 20, 0.08);
+      --shadow: 0 4px 14px rgba(33, 24, 17, 0.035);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
-      background:
-        radial-gradient(circle at top left, rgba(201, 35, 18, 0.10), transparent 26%),
-        linear-gradient(180deg, #faf6f0 0%, #f2e8da 100%);
+      background: var(--bg);
       color: var(--text);
       font-family: "Sukhumvit Set", "Noto Sans Thai", "SF Pro Display", sans-serif;
     }
     .wrap {
-      max-width: 1180px;
+      max-width: 1120px;
       margin: 0 auto;
-      padding: 32px 20px 72px;
+      padding: 22px 18px 44px;
     }
     .page-head {
       display: grid;
-      gap: 10px;
-      margin-bottom: 22px;
+      gap: 4px;
+      margin-bottom: 14px;
     }
-    .eyebrow {
-      display: inline-flex;
-      width: fit-content;
-      padding: 7px 12px;
-      border-radius: 999px;
-      background: rgba(201, 35, 18, 0.10);
-      color: #8f2012;
-      font-size: 12px;
+    .page-kicker {
+      margin: 0;
+      color: #8a7868;
+      font-size: 11px;
       font-weight: 800;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.12em;
       text-transform: uppercase;
     }
     .page-title {
       margin: 0;
-      font-size: clamp(32px, 5vw, 56px);
-      line-height: 0.98;
-      letter-spacing: -0.04em;
-      font-weight: 900;
+      font-size: clamp(26px, 3.4vw, 34px);
+      line-height: 1.08;
+      letter-spacing: -0.025em;
+      font-weight: 800;
     }
     .page-copy {
       margin: 0;
       color: var(--muted);
-      max-width: 70ch;
-      line-height: 1.6;
-      font-size: 16px;
+      max-width: 52ch;
+      line-height: 1.45;
+      font-size: 13px;
     }
     .layout {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 340px;
-      gap: 20px;
+      grid-template-columns: minmax(0, 1fr) 300px;
+      gap: 14px;
       align-items: start;
     }
     .main-column {
       display: grid;
-      gap: 18px;
+      gap: 12px;
     }
     .panel {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 26px;
+      border-radius: 14px;
       box-shadow: var(--shadow);
-      padding: 22px;
+      padding: 16px;
     }
     .panel.soft {
-      background: rgba(255, 251, 246, 0.84);
+      background: var(--panel-soft);
+    }
+    .panel.compact {
+      padding: 14px;
+    }
+    .panel.emphasis {
+      background: linear-gradient(180deg, #fffdfa 0%, #f8f2ea 100%);
+      border-color: #d8cab9;
     }
     .section-head {
       display: grid;
-      gap: 6px;
-      margin-bottom: 16px;
+      gap: 4px;
+      margin-bottom: 10px;
     }
     .section-title {
       margin: 0;
-      font-size: 20px;
-      line-height: 1.1;
-      font-weight: 900;
-      letter-spacing: -0.02em;
+      font-size: 17px;
+      line-height: 1.2;
+      font-weight: 800;
+      letter-spacing: -0.01em;
     }
     .section-copy {
       margin: 0;
       color: var(--muted);
-      font-size: 14px;
-      line-height: 1.55;
+      font-size: 13px;
+      line-height: 1.5;
     }
     .form-grid {
       display: grid;
-      gap: 14px;
+      gap: 10px;
     }
     .two-col {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
+      gap: 12px;
     }
     .three-col {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 14px;
+      gap: 12px;
     }
     label {
       display: grid;
-      gap: 8px;
+      gap: 5px;
       color: var(--muted);
-      font-size: 14px;
+      font-size: 12px;
       font-weight: 700;
     }
     .field-note {
@@ -2114,10 +2115,10 @@ const uiHtml = `<!doctype html>
     input, select {
       width: 100%;
       border: 1px solid var(--line);
-      border-radius: 16px;
-      min-height: 54px;
-      height: 54px;
-      padding: 15px 16px;
+      border-radius: 10px;
+      min-height: 44px;
+      height: 44px;
+      padding: 10px 12px;
       background: #fff;
       color: var(--text);
       transition: border-color 140ms ease, box-shadow 140ms ease;
@@ -2149,16 +2150,16 @@ const uiHtml = `<!doctype html>
     }
     .option-boxes {
       display: grid;
-      gap: 12px;
+      gap: 8px;
     }
     .check-item {
       display: grid;
       grid-template-columns: auto 1fr;
-      gap: 12px;
+      gap: 10px;
       align-items: start;
-      padding: 14px 16px;
-      border: 1px solid var(--line);
-      border-radius: 18px;
+      padding: 10px 12px;
+      border: 1px solid #ece4da;
+      border-radius: 12px;
       background: #fff;
       color: var(--text);
       font-weight: 600;
@@ -2179,14 +2180,14 @@ const uiHtml = `<!doctype html>
     }
     .actions {
       display: flex;
-      gap: 12px;
+      gap: 8px;
       flex-wrap: wrap;
-      margin-top: 4px;
+      margin-top: 2px;
     }
     button {
       border: 0;
-      border-radius: 999px;
-      padding: 14px 20px;
+      border-radius: 10px;
+      padding: 11px 16px;
       font-weight: 800;
       cursor: pointer;
       transition: transform 140ms ease, opacity 140ms ease;
@@ -2197,7 +2198,7 @@ const uiHtml = `<!doctype html>
     .primary {
       background: linear-gradient(180deg, var(--accent) 0%, var(--accent-dark) 100%);
       color: #fff;
-      box-shadow: 0 12px 24px rgba(150, 23, 7, 0.18);
+      box-shadow: 0 8px 18px rgba(150, 23, 7, 0.14);
     }
     .secondary {
       background: #fff;
@@ -2206,47 +2207,23 @@ const uiHtml = `<!doctype html>
     }
     .sidebar {
       display: grid;
-      gap: 18px;
+      gap: 12px;
       position: sticky;
-      top: 20px;
-    }
-    .summary-grid {
-      display: grid;
-      gap: 10px;
-    }
-    .summary-item {
-      padding: 14px 15px;
-      border-radius: 18px;
-      background: var(--panel-soft);
-      border: 1px solid var(--line);
-    }
-    .summary-label {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      margin-bottom: 6px;
-    }
-    .summary-value {
-      margin: 0;
-      font-size: 16px;
-      font-weight: 800;
-      line-height: 1.35;
+      top: 16px;
     }
     .preview-list {
       display: grid;
-      gap: 10px;
+      gap: 8px;
     }
     .ticket-holder-list {
       display: grid;
-      gap: 12px;
+      gap: 10px;
     }
     .ticket-holder-card {
       display: grid;
-      gap: 10px;
-      padding: 14px;
-      border-radius: 18px;
+      gap: 8px;
+      padding: 10px;
+      border-radius: 12px;
       border: 1px solid var(--line);
       background: #fff;
     }
@@ -2261,8 +2238,8 @@ const uiHtml = `<!doctype html>
     .preview-row {
       display: grid;
       gap: 4px;
-      padding: 12px 14px;
-      border-radius: 16px;
+      padding: 9px 10px;
+      border-radius: 10px;
       background: var(--panel-soft);
       border: 1px solid var(--line);
     }
@@ -2283,15 +2260,15 @@ const uiHtml = `<!doctype html>
     }
     .status {
       display: grid;
-      gap: 12px;
+      gap: 10px;
     }
     .status-badge {
       display: inline-flex;
       align-items: center;
       width: fit-content;
       border-radius: 999px;
-      padding: 8px 14px;
-      font-size: 13px;
+      padding: 6px 11px;
+      font-size: 11px;
       font-weight: 800;
       letter-spacing: 0.06em;
       text-transform: uppercase;
@@ -2316,26 +2293,27 @@ const uiHtml = `<!doctype html>
     }
     .status-log {
       margin: 0;
-      line-height: 1.6;
+      line-height: 1.5;
       font-size: 15px;
+      font-weight: 700;
     }
     .hint {
       margin: 0;
       color: var(--muted);
-      font-size: 13px;
-      line-height: 1.55;
+      font-size: 12px;
+      line-height: 1.5;
     }
     .rounds {
       display: grid;
-      gap: 12px;
+      gap: 10px;
     }
     .round-picker {
       display: grid;
-      gap: 8px;
-      padding: 16px;
+      gap: 6px;
+      padding: 10px;
       border: 1px solid var(--line);
-      border-radius: 22px;
-      background: var(--panel-soft);
+      border-radius: 12px;
+      background: #fff;
     }
     .round-select-label {
       display: grid;
@@ -2347,20 +2325,20 @@ const uiHtml = `<!doctype html>
       text-transform: uppercase;
     }
     .sale-open-note {
-      margin-top: 10px;
+      margin-top: 4px;
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 10px 14px;
-      border-radius: 14px;
+      padding: 7px 10px;
+      border-radius: 10px;
       background: #fff6df;
       border: 1px solid #ecd8a6;
       color: #7c5d16;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 700;
     }
     .round-list {
-      border-radius: 22px;
+      border-radius: 14px;
       overflow: hidden;
       border: 1px solid var(--line);
       background: var(--panel);
@@ -2374,10 +2352,10 @@ const uiHtml = `<!doctype html>
       align-items: center;
     }
     .round-head {
-      padding: 14px 18px;
+      padding: 12px 14px;
       background: var(--panel-soft);
       color: var(--muted);
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 800;
       border-bottom: 1px solid var(--line);
     }
@@ -2388,7 +2366,7 @@ const uiHtml = `<!doctype html>
       border-radius: 0;
       background: var(--panel);
       color: var(--text);
-      padding: 18px;
+      padding: 14px;
       text-align: left;
       box-shadow: none;
     }
@@ -2400,33 +2378,33 @@ const uiHtml = `<!doctype html>
       background: #fff4ec;
     }
     .round-date {
-      font-size: 17px;
+      font-size: 16px;
       font-weight: 800;
     }
     .round-venue {
       color: var(--muted);
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 700;
-      margin-bottom: 6px;
+      margin-bottom: 4px;
     }
     .round-price {
       color: #8b7b6f;
-      font-size: 12px;
-      margin-top: 4px;
+      font-size: 11px;
+      margin-top: 3px;
     }
     .round-meta {
       display: grid;
       justify-items: end;
-      gap: 8px;
+      gap: 6px;
     }
     .round-time {
-      min-width: 126px;
+      min-width: 112px;
       text-align: center;
       border-radius: 999px;
-      padding: 10px 16px;
+      padding: 8px 14px;
       background: linear-gradient(180deg, var(--accent) 0%, var(--accent-dark) 100%);
       color: #fff;
-      font-size: 19px;
+      font-size: 17px;
       font-weight: 900;
     }
     .round-sale-badge {
@@ -2461,7 +2439,7 @@ const uiHtml = `<!doctype html>
     }
     @media (max-width: 720px) {
       .wrap {
-        padding: 24px 14px 48px;
+        padding: 22px 14px 42px;
       }
       .two-col, .three-col {
         grid-template-columns: 1fr;
@@ -2478,16 +2456,16 @@ const uiHtml = `<!doctype html>
 <body>
   <main class="wrap">
     <header class="page-head">
-      <span class="eyebrow">Ticket Bot Control</span>
-      <h1 class="page-title">ตั้งค่างานกดบัตรในหน้าเดียว</h1>
-      <p class="page-copy">แยกข้อมูลลูกค้า, ข้อมูลงาน, และเงื่อนไข auto เลือกที่นั่งให้ชัดขึ้น เพื่อให้เริ่มงานง่ายและอ่านสถานะระหว่าง flow ได้เร็วกว่าเดิม</p>
+      <p class="page-kicker">Control Panel</p>
+      <h1 class="page-title">Ticket Bot</h1>
+      <p class="page-copy">ตั้งค่างาน, เลือกรอบ, และดูสถานะของ flow จากหน้าเดียว</p>
     </header>
     <section class="layout">
       <section class="main-column">
-        <section class="panel">
+        <section class="panel compact">
           <div class="section-head">
             <h2 class="section-title">ข้อมูลงานที่ต้องการกดบัตร</h2>
-            <p class="section-copy">ใส่ลิงก์ concert หรือ performance แล้วโหลดรอบจากหน้า event เพื่อเลือกรอบที่ต้องการ</p>
+            <p class="section-copy">ใส่ลิงก์งานแล้วโหลดรอบจากหน้า event</p>
           </div>
           <div class="form-grid">
             <label>
@@ -2508,10 +2486,10 @@ const uiHtml = `<!doctype html>
           </div>
         </section>
 
-        <section class="panel soft">
+        <section class="panel soft compact">
           <div class="section-head">
             <h2 class="section-title">ข้อมูลลูกค้า</h2>
-            <p class="section-copy">ถ้าใส่ข้อมูล login หรือ verify มา ระบบจะช่วยกรอกให้เองในขั้นที่รองรับ ถ้าเว้นว่าง ลูกค้าจะต้องทำด้วยมือ</p>
+            <p class="section-copy">กรอกเฉพาะส่วนที่ต้องการให้ระบบช่วยกรอกอัตโนมัติ</p>
           </div>
           <div class="form-grid">
             <div class="two-col">
@@ -2549,10 +2527,10 @@ const uiHtml = `<!doctype html>
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel compact">
           <div class="section-head">
             <h2 class="section-title">ข้อมูลสำหรับ Auto เลือก Zone / ที่นั่ง</h2>
-            <p class="section-copy">กำหนดจำนวนบัตร, โซนที่อยากลองก่อน, ที่นั่งที่ต้องการ และ fallback rule ตอนที่นั่งเต็ม</p>
+            <p class="section-copy">ตั้งจำนวนบัตร, โซน, ที่นั่ง, และ fallback ตอนเต็ม</p>
           </div>
           <div class="form-grid">
             <div class="three-col">
@@ -2565,6 +2543,24 @@ const uiHtml = `<!doctype html>
                 <input id="zonePreference" type="text" placeholder="เช่น A2, A3, B2" />
               </label>
               <label>
+                Preferred seats
+                <input id="preferredSeats" type="text" placeholder="เช่น G-49, G-50" />
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                ลำดับการเลือกที่นั่งเมื่อไม่ได้ระบุเลขที่นั่ง
+                <select id="seatSelectionStrategy">
+                  <option value="default">ใช้ลำดับเดิมของระบบ</option>
+                  <option value="closest-stage">ใกล้เวทีที่สุด</option>
+                  <option value="center-most">กลางสุด</option>
+                  <option value="front-left">ข้างหน้าซ้ายไปขวา</option>
+                  <option value="front-right">ข้างหน้าขวาไปซ้าย</option>
+                  <option value="back-left">ข้างหลังซ้ายไปขวา</option>
+                  <option value="back-right">ข้างหลังขวาไปซ้าย</option>
+                </select>
+              </label>
+              <label>
                 ประเภทโซน
                 <select id="zoneTypePreference">
                   <option value="both">ได้ทั้ง Standing และ Seating</option>
@@ -2572,23 +2568,7 @@ const uiHtml = `<!doctype html>
                   <option value="seating-only">Seating only</option>
                 </select>
               </label>
-              <label>
-                Preferred seats
-                <input id="preferredSeats" type="text" placeholder="เช่น G-49, G-50" />
-              </label>
             </div>
-            <label>
-              ลำดับการเลือกที่นั่งเมื่อไม่ได้ระบุเลขที่นั่ง
-              <select id="seatSelectionStrategy">
-                <option value="default">ใช้ลำดับเดิมของระบบ</option>
-                <option value="closest-stage">ใกล้เวทีที่สุด</option>
-                <option value="center-most">กลางสุด</option>
-                <option value="front-left">ข้างหน้าซ้ายไปขวา</option>
-                <option value="front-right">ข้างหน้าขวาไปซ้าย</option>
-                <option value="back-left">ข้างหลังซ้ายไปขวา</option>
-                <option value="back-right">ข้างหลังขวาไปซ้าย</option>
-              </select>
-            </label>
             <div>
               <div class="section-copy" style="margin-bottom:12px;">ชื่อบนบัตรจะสร้างตามจำนวนบัตร และใช้กรอกในหน้า register อัตโนมัติถ้ากรอกมาครบ</div>
               <div id="ticketHolderFields" class="ticket-holder-list"></div>
@@ -2608,10 +2588,10 @@ const uiHtml = `<!doctype html>
       </section>
 
       <aside class="sidebar">
-        <section class="panel">
+        <section class="panel emphasis">
           <div class="section-head">
             <h2 class="section-title">สถานะการทำงาน</h2>
-            <p class="section-copy">ติดตามได้ว่าตอนนี้ระบบกำลังรอ login, verify, queue หรือเข้าสู่ขั้นเลือกที่นั่งแล้ว</p>
+            <p class="section-copy">ดูขั้นตอนล่าสุดก่อนหน้า payment</p>
           </div>
           <div class="status">
             <div id="statusBadge" class="status-badge idle">พร้อม</div>
@@ -2619,37 +2599,12 @@ const uiHtml = `<!doctype html>
           </div>
         </section>
 
-        <section class="panel soft">
+        <section class="panel soft compact">
           <div class="section-head">
             <h2 class="section-title">Preview ก่อนเริ่ม</h2>
-            <p class="section-copy">สรุป config ที่ระบบจะใช้กับรอบนี้ก่อนกดเริ่มทำงาน</p>
+            <p class="section-copy">สรุปค่าที่จะใช้ก่อนเริ่มงาน</p>
           </div>
           <div id="configPreview" class="preview-list"></div>
-        </section>
-
-        <section class="panel soft">
-          <div class="section-head">
-            <h2 class="section-title">สรุปสั้น ๆ</h2>
-            <p class="section-copy">แนวทางใช้งานของหน้าควบคุมนี้</p>
-          </div>
-          <div class="summary-grid">
-            <div class="summary-item">
-              <div class="summary-label">Link Concert</div>
-              <p class="summary-value">ใส่ URL งานที่ต้องการกดบัตรก่อนทุกครั้ง</p>
-            </div>
-            <div class="summary-item">
-              <div class="summary-label">ช่วงเวลา</div>
-              <p class="summary-value">โหลดรอบจากหน้า event แล้วเลือกแถวที่เปิดขาย</p>
-            </div>
-            <div class="summary-item">
-              <div class="summary-label">ข้อมูลลูกค้า</div>
-              <p class="summary-value">login และ verify ใส่เฉพาะเมื่ออยากให้ระบบช่วยกรอก</p>
-            </div>
-            <div class="summary-item">
-              <div class="summary-label">Auto Seat</div>
-              <p class="summary-value">ระบบจะใช้ zone / seat ตามลำดับที่ระบุและ fallback ตาม checkbox</p>
-            </div>
-          </div>
         </section>
       </aside>
     </section>
